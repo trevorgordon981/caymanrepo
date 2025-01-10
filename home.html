@@ -1,0 +1,18 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>StockPicker - Home</title>
+</head>
+<body>
+    <h1>StockPicker</h1>
+    <form method="POST" action="/">
+        <input type="text" name="ticker" placeholder="Enter stock ticker" required>
+        <button type="submit">Get Price</button>
+    </form>
+    {% if error_message %}
+        <p style="color: red;">{{ error_message }}</p>
+    {% endif %}
+</body>
+</html>
