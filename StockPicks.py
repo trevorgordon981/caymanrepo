@@ -28,9 +28,30 @@ def get_stock_data(ticker):
             'low': data['Global Quote']['04. low'],
             'volume': data['Global Quote']['06. volume']
         }
+        # Add moving averages to stock data
+        stock_data.update(get_moving_averages(ticker))
         return stock_data
     else:
         return None
+
+    
+def get_moving_averages(ticker):
+    moving_averages = {}
+    for time_period in [50, 200]:
+        url = f"https://www.alphavantage.co/query?function=SMA&symbol={ticker.upper()}&interval=daily&time_period={time_period}&series_type=close&apikey={API_KEY}"
+        response = requests.get(url)
+        data = response.json()
+        
+        # Extract the most recent SMA value
+        if 'Technical Analysis: SMA' in data:
+            sma_data = data['Technical Analysis: SMA']
+            most_recent_date = list(sma_data.keys())[0]
+            moving_averages[f'{time_period}_day'] = sma_data[most_recent_date]['SMA']
+        else:
+            moving_averages[f'{time_period}_day'] = "N/A"
+    
+    return moving_averages
+
 
 # Home route
 @app.route("/", methods=["GET", "POST"])
