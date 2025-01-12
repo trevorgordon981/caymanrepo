@@ -16,24 +16,21 @@ API_KEY = "GTU4V5Y3SCLWFC2C"
 
 # Function to get stock data
 def get_stock_data(ticker):
-    url = f"https://www.alphavantage.co/query?function=GLOBAL_QUOTE&symbol={ticker.upper()}&apikey={API_KEY}"
-    response = requests.get(url)
-    data = response.json()
-    
-    # Debugging: Print the API response
-    print("Alpha Vantage Response:", data)
-    
-    if 'Global Quote' in data:
+    stock = yf.Ticker(ticker)
+    try:
+        price = stock.history(period="1d")['Close'].iloc[-1]
         return {
             'symbol': ticker.upper(),
-            'price': data['Global Quote'].get('05. price', 'N/A'),
-            'open': data['Global Quote'].get('02. open', 'N/A'),
-            'high': data['Global Quote'].get('03. high', 'N/A'),
-            'low': data['Global Quote'].get('04. low', 'N/A'),
-            'volume': data['Global Quote'].get('06. volume', 'N/A')
+            'price': f"{price:.2f}",  # Format to 2 decimal places
+            'open': "N/A",  # Replace with actual data if needed
+            'high': "N/A",
+            'low': "N/A",
+            'volume': "N/A"
         }
-    else:
+    except Exception as e:
+        print(f"Error fetching data for {ticker}: {e}")
         return None
+
 
     
 # Function to get dividend data
