@@ -52,16 +52,23 @@ def get_historical_data(ticker, outputsize="compact"):
     url = f"https://www.alphavantage.co/query?function=TIME_SERIES_DAILY_ADJUSTED&symbol={ticker.upper()}&outputsize={outputsize}&apikey={API_KEY}"
     response = requests.get(url)
     data = response.json()
+    
+    # Debugging: Print the raw response
+    print("Alpha Vantage API Response:", data)
+    
     if 'Time Series (Daily)' in data:
         return pd.DataFrame.from_dict(data['Time Series (Daily)'], orient='index', dtype=float)
     else:
         return None
 
+
 # Function to generate the graph
 def generate_graph(ticker, timeframe):
     outputsize = "full" if timeframe in ["2 years", "5 years", "10 years"] else "compact"
     data = get_historical_data(ticker, outputsize)
-    if data is None:
+    
+    if data is None or data.empty:
+        print(f"No data available for {ticker.upper()} with timeframe {timeframe}.")
         return None
 
     data.index = pd.to_datetime(data.index)
@@ -87,6 +94,11 @@ def generate_graph(ticker, timeframe):
 
     filtered_data = data.loc[start_date:end_date]
 
+    # Ensure filtered data is not empty
+    if filtered_data.empty:
+        print(f"No filtered data available for {ticker.upper()} in the selected timeframe.")
+        return None
+
     plt.figure(figsize=(10, 6))
     plt.plot(filtered_data.index, filtered_data['5. adjusted close'], label="Adjusted Close Price")
     plt.title(f"{ticker.upper()} Stock Price ({timeframe})")
@@ -102,6 +114,7 @@ def generate_graph(ticker, timeframe):
     buf.close()
     plt.close()
     return graph_url
+
 
 # Home route
 @app.route("/", methods=["GET", "POST"])
@@ -122,15 +135,16 @@ def home():
     return render_template("home.html")
 
 # Route for graph
-@app.route("/graph/<timeframe>", methods=["GET"])
+@app.route("/graph/<timeframe>", methods=["GET", "POST"])
 def graph(timeframe):
-    ticker = request.args.get("ticker", "AAPL")
+    ticker = request.args.get("ticker", "AAPL").upper()  # Ensure ticker is uppercase
     graph_url = generate_graph(ticker, timeframe)
     if graph_url:
         return render_template("graph.html", graph_url=graph_url, ticker=ticker, timeframe=timeframe)
     else:
         error_message = f"Failed to generate graph for {ticker.upper()}."
         return render_template("home.html", error_message=error_message)
+
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=8080, debug=True)
