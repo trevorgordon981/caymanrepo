@@ -1,0 +1,13 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>StockPicker - Graph</title>
+</head>
+<body>
+    <h1>{{ ticker.upper() }} Stock Price ({{ timeframe }})</h1>
+    <img src="data:image/png;base64,{{ graph_url }}" alt="Stock Graph">
+    <a href="/">Go back</a>
+</body>
+</html>
