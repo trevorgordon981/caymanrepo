@@ -13,6 +13,40 @@ app = Flask(__name__, template_folder="templates")
 # Alpha Vantage API key (replace with your own)
 API_KEY = "GTU4V5Y3SCLWFC2C"
 
+# Function to get stock data
+def get_stock_data(ticker):
+    url = f"https://www.alphavantage.co/query?function=GLOBAL_QUOTE&symbol={ticker.upper()}&apikey={API_KEY}"
+    response = requests.get(url)
+    data = response.json()
+    if 'Global Quote' in data:
+        stock_data = {
+            'symbol': ticker.upper(),
+            'price': data['Global Quote']['05. price'],
+            'open': data['Global Quote']['02. open'],
+            'high': data['Global Quote']['03. high'],
+            'low': data['Global Quote']['04. low'],
+            'volume': data['Global Quote']['06. volume']
+        }
+        stock_data.update(get_moving_averages(ticker))
+        return stock_data
+    else:
+        return None
+
+# Function to get moving averages
+def get_moving_averages(ticker):
+    moving_averages = {}
+    for time_period in [50, 200]:
+        url = f"https://www.alphavantage.co/query?function=SMA&symbol={ticker.upper()}&interval=daily&time_period={time_period}&series_type=close&apikey={API_KEY}"
+        response = requests.get(url)
+        data = response.json()
+        if 'Technical Analysis: SMA' in data:
+            sma_data = data['Technical Analysis: SMA']
+            most_recent_date = list(sma_data.keys())[0]
+            moving_averages[f'{time_period}_day'] = sma_data[most_recent_date]['SMA']
+        else:
+            moving_averages[f'{time_period}_day'] = "N/A"
+    return moving_averages
+
 # Function to get historical data for the graph
 def get_historical_data(ticker, outputsize="compact"):
     url = f"https://www.alphavantage.co/query?function=TIME_SERIES_DAILY_ADJUSTED&symbol={ticker.upper()}&outputsize={outputsize}&apikey={API_KEY}"
@@ -25,17 +59,14 @@ def get_historical_data(ticker, outputsize="compact"):
 
 # Function to generate the graph
 def generate_graph(ticker, timeframe):
-    # Fetch historical data
     outputsize = "full" if timeframe in ["2 years", "5 years", "10 years"] else "compact"
     data = get_historical_data(ticker, outputsize)
     if data is None:
         return None
 
-    # Convert index to datetime and sort
     data.index = pd.to_datetime(data.index)
     data = data.sort_index()
 
-    # Filter data based on the selected timeframe
     end_date = data.index.max()
     if timeframe == "5 days":
         start_date = end_date - pd.Timedelta(days=5)
@@ -56,7 +87,6 @@ def generate_graph(ticker, timeframe):
 
     filtered_data = data.loc[start_date:end_date]
 
-    # Plot the graph
     plt.figure(figsize=(10, 6))
     plt.plot(filtered_data.index, filtered_data['5. adjusted close'], label="Adjusted Close Price")
     plt.title(f"{ticker.upper()} Stock Price ({timeframe})")
@@ -65,7 +95,6 @@ def generate_graph(ticker, timeframe):
     plt.legend()
     plt.grid(True)
 
-    # Save the graph to a buffer
     buf = BytesIO()
     plt.savefig(buf, format="png")
     buf.seek(0)
@@ -78,8 +107,18 @@ def generate_graph(ticker, timeframe):
 @app.route("/", methods=["GET", "POST"])
 def home():
     if request.method == "POST":
+        action = request.form.get("action")
         ticker = request.form["ticker"]
-        return render_template("stock.html", ticker=ticker)
+        if action == "price":
+            stock_data = get_stock_data(ticker)
+            if stock_data:
+                return render_template("stock.html", stock_data=stock_data)
+            else:
+                error_message = f"No data found for ticker: {ticker.upper()}"
+                return render_template("home.html", error_message=error_message)
+        elif action == "graph":
+            timeframe = request.form["timeframe"]
+            return graph(timeframe)
     return render_template("home.html")
 
 # Route for graph
@@ -93,6 +132,5 @@ def graph(timeframe):
         error_message = f"Failed to generate graph for {ticker.upper()}."
         return render_template("home.html", error_message=error_message)
 
-# Run the app
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=8080, debug=True)
