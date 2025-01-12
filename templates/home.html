@@ -7,10 +7,18 @@
 </head>
 <body>
     <h1>StockPicker</h1>
+    
+    <!-- Form for Getting Price with Moving Averages -->
     <form method="POST" action="/">
         <input type="text" name="ticker" placeholder="Enter stock ticker" required>
         <button type="submit" name="action" value="price">Get Price with Moving Averages</button>
-        <br><br>
+    </form>
+    
+    <br><br>
+    
+    <!-- Form for Generating Graph -->
+    <form method="GET" action="/graph/">
+        <input type="text" name="ticker" placeholder="Enter stock ticker" required>
         <label for="timeframe">Select Timeframe for Graph:</label>
         <select name="timeframe">
             <option value="5 days">5 Days</option>
@@ -21,10 +29,12 @@
             <option value="5 years">5 Years</option>
             <option value="10 years">10 Years</option>
         </select>
-        <button type="submit" name="action" value="graph">Generate Graph</button>
+        <button type="submit">Generate Graph</button>
     </form>
+    
     {% if error_message %}
         <p style="color: red;">{{ error_message }}</p>
     {% endif %}
 </body>
 </html>
+

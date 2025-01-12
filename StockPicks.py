@@ -174,13 +174,25 @@ def home():
 # Route for graph
 @app.route("/graph/<timeframe>", methods=["GET", "POST"])
 def graph(timeframe):
-    ticker = request.args.get("ticker", "AAPL").upper()  # Ensure ticker is uppercase
+    # Get the ticker from the form or query parameters
+    ticker = request.args.get("ticker") or request.form.get("ticker")
+    
+    # If no ticker is provided, return an error message
+    if not ticker:
+        error_message = "Please provide a stock ticker to generate the graph."
+        return render_template("home.html", error_message=error_message)
+    
+    # Convert the ticker to uppercase
+    ticker = ticker.upper()
+    
+    # Generate the graph for the provided ticker and timeframe
     graph_url = generate_graph_yf(ticker, timeframe)
     if graph_url:
         return render_template("graph.html", graph_url=graph_url, ticker=ticker, timeframe=timeframe)
     else:
-        error_message = f"Failed to generate graph for {ticker.upper()}."
+        error_message = f"Failed to generate graph for {ticker}."
         return render_template("home.html", error_message=error_message)
+
 
 
 
