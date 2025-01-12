@@ -6,6 +6,7 @@ import matplotlib.pyplot as plt
 import pandas as pd
 from io import BytesIO
 import base64
+import yfinance as yf
 
 # Initialize Flask app
 app = Flask(__name__, template_folder="templates")
@@ -31,6 +32,17 @@ def get_stock_data(ticker):
         return stock_data
     else:
         return None
+    
+# Function to get dividend data
+def get_dividend_data(ticker):
+    stock = yf.Ticker(ticker)
+    dividends = stock.dividends  # Retrieve dividend data
+    
+    # Convert to DataFrame for easier handling
+    dividend_df = dividends.reset_index()
+    dividend_df.columns = ['Date', 'Dividend']
+    
+    return dividend_df.tail(5)  # Return the most recent 5 dividends
 
 # Function to get moving averages
 def get_moving_averages(ticker):
@@ -49,7 +61,7 @@ def get_moving_averages(ticker):
 
 # Function to get historical data for the graph
 def get_historical_data(ticker, outputsize="compact"):
-    url = f"https://www.alphavantage.co/query?function=TIME_SERIES_DAILY_ADJUSTED&symbol={ticker.upper()}&outputsize={outputsize}&apikey={API_KEY}"
+    url = f"https://www.alphavantage.co/query?function=TIME_SERIES_DAILY&symbol={ticker.upper()}&outputsize={outputsize}&apikey={API_KEY}"
     response = requests.get(url)
     data = response.json()
     
@@ -60,6 +72,7 @@ def get_historical_data(ticker, outputsize="compact"):
         return pd.DataFrame.from_dict(data['Time Series (Daily)'], orient='index', dtype=float)
     else:
         return None
+
 
 
 # Function to generate the graph
@@ -122,17 +135,22 @@ def home():
     if request.method == "POST":
         action = request.form.get("action")
         ticker = request.form["ticker"]
+        
         if action == "price":
             stock_data = get_stock_data(ticker)
+            dividends = get_dividend_data(ticker)  # Fetch dividend data
             if stock_data:
-                return render_template("stock.html", stock_data=stock_data)
+                return render_template("stock.html", stock_data=stock_data, dividends=dividends)
             else:
                 error_message = f"No data found for ticker: {ticker.upper()}"
                 return render_template("home.html", error_message=error_message)
+        
         elif action == "graph":
             timeframe = request.form["timeframe"]
             return graph(timeframe)
+    
     return render_template("home.html")
+
 
 # Route for graph
 @app.route("/graph/<timeframe>", methods=["GET", "POST"])

@@ -11,6 +11,21 @@
     <p>Price: ${{ stock_data['price'] }}</p>
     <p>50-Day Moving Average: ${{ stock_data['50_day'] }}</p>
     <p>200-Day Moving Average: ${{ stock_data['200_day'] }}</p>
+
+    <h2>Recent Dividends</h2>
+    <table border="1">
+        <tr>
+            <th>Date</th>
+            <th>Dividend</th>
+        </tr>
+        {% for index, row in dividends.iterrows() %}
+        <tr>
+            <td>{{ row['Date'].strftime('%Y-%m-%d') }}</td>
+            <td>${{ row['Dividend'] }}</td>
+        </tr>
+        {% endfor %}
+    </table>
+
     <a href="/">Go back</a>
 </body>
 </html>
