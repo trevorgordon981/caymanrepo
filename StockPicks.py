@@ -59,34 +59,29 @@ def get_moving_averages(ticker):
             moving_averages[f'{time_period}_day'] = "N/A"
     return moving_averages
 
-# Function to get historical data for the graph
-def get_historical_data(ticker, outputsize="compact"):
-    url = f"https://www.alphavantage.co/query?function=TIME_SERIES_DAILY&symbol={ticker.upper()}&outputsize={outputsize}&apikey={API_KEY}"
-    response = requests.get(url)
-    data = response.json()
+# Function to get historical data using Yahoo Finance
+def get_historical_data_yf(ticker):
+    stock = yf.Ticker(ticker)
+    hist_data = stock.history(period="max")  # Fetch maximum available historical data
     
-    # Debugging: Print the raw response
-    print("Alpha Vantage API Response:", data)
-    
-    if 'Time Series (Daily)' in data:
-        return pd.DataFrame.from_dict(data['Time Series (Daily)'], orient='index', dtype=float)
-    else:
+    if hist_data.empty:
+        print(f"No historical data available for {ticker.upper()}.")
         return None
+    
+    return hist_data
+
 
 
 
 # Function to generate the graph
-def generate_graph(ticker, timeframe):
-    outputsize = "full" if timeframe in ["2 years", "5 years", "10 years"] else "compact"
-    data = get_historical_data(ticker, outputsize)
+# Function to generate the graph using Yahoo Finance data
+def generate_graph_yf(ticker, timeframe):
+    data = get_historical_data_yf(ticker)
     
-    if data is None or data.empty:
-        print(f"No data available for {ticker.upper()} with timeframe {timeframe}.")
+    if data is None:
         return None
 
-    data.index = pd.to_datetime(data.index)
-    data = data.sort_index()
-
+    # Filter data based on the selected timeframe
     end_date = data.index.max()
     if timeframe == "5 days":
         start_date = end_date - pd.Timedelta(days=5)
@@ -106,6 +101,30 @@ def generate_graph(ticker, timeframe):
         start_date = end_date
 
     filtered_data = data.loc[start_date:end_date]
+
+    # Ensure filtered data is not empty
+    if filtered_data.empty:
+        print(f"No filtered data available for {ticker.upper()} in the selected timeframe.")
+        return None
+
+    # Plot the graph
+    plt.figure(figsize=(10, 6))
+    plt.plot(filtered_data.index, filtered_data['Close'], label="Close Price")  # Use 'Close' column
+    plt.title(f"{ticker.upper()} Stock Price ({timeframe})")
+    plt.xlabel("Date")
+    plt.ylabel("Price")
+    plt.legend()
+    plt.grid(True)
+
+    buf = BytesIO()
+    plt.savefig(buf, format="png")
+    buf.seek(0)
+    graph_url = base64.b64encode(buf.getvalue()).decode('utf8')
+    buf.close()
+    plt.close()
+    return graph_url
+
+
 
     # Ensure filtered data is not empty
     if filtered_data.empty:
@@ -156,12 +175,13 @@ def home():
 @app.route("/graph/<timeframe>", methods=["GET", "POST"])
 def graph(timeframe):
     ticker = request.args.get("ticker", "AAPL").upper()  # Ensure ticker is uppercase
-    graph_url = generate_graph(ticker, timeframe)
+    graph_url = generate_graph_yf(ticker, timeframe)
     if graph_url:
         return render_template("graph.html", graph_url=graph_url, ticker=ticker, timeframe=timeframe)
     else:
         error_message = f"Failed to generate graph for {ticker.upper()}."
         return render_template("home.html", error_message=error_message)
+
 
 
 if __name__ == "__main__":
