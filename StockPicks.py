@@ -19,30 +19,36 @@ def get_stock_data(ticker):
     url = f"https://www.alphavantage.co/query?function=GLOBAL_QUOTE&symbol={ticker.upper()}&apikey={API_KEY}"
     response = requests.get(url)
     data = response.json()
+    
+    # Debugging: Print the API response
+    print("Alpha Vantage Response:", data)
+    
     if 'Global Quote' in data:
-        stock_data = {
+        return {
             'symbol': ticker.upper(),
-            'price': data['Global Quote']['05. price'],
-            'open': data['Global Quote']['02. open'],
-            'high': data['Global Quote']['03. high'],
-            'low': data['Global Quote']['04. low'],
-            'volume': data['Global Quote']['06. volume']
+            'price': data['Global Quote'].get('05. price', 'N/A'),
+            'open': data['Global Quote'].get('02. open', 'N/A'),
+            'high': data['Global Quote'].get('03. high', 'N/A'),
+            'low': data['Global Quote'].get('04. low', 'N/A'),
+            'volume': data['Global Quote'].get('06. volume', 'N/A')
         }
-        stock_data.update(get_moving_averages(ticker))
-        return stock_data
     else:
         return None
+
     
 # Function to get dividend data
 def get_dividend_data(ticker):
     stock = yf.Ticker(ticker)
-    dividends = stock.dividends  # Retrieve dividend data
+    dividends = stock.dividends
     
-    # Convert to DataFrame for easier handling
+    if dividends.empty:
+        print(f"No dividend data available for {ticker}.")
+        return None
+    
     dividend_df = dividends.reset_index()
     dividend_df.columns = ['Date', 'Dividend']
-    
-    return dividend_df.tail(5)  # Return the most recent 5 dividends
+    return dividend_df.tail(5)  # Return the last 5 diviends
+
 
 # Function to get moving averages
 def get_moving_averages(ticker):
@@ -153,15 +159,15 @@ def generate_graph_yf(ticker, timeframe):
 def home():
     if request.method == "POST":
         action = request.form.get("action")
-        ticker = request.form["ticker"]
+        ticker = request.form["ticker"].strip()
         
         if action == "price":
             stock_data = get_stock_data(ticker)
-            dividends = get_dividend_data(ticker)  # Fetch dividend data
-            if stock_data:
+            dividends = get_dividend_data(ticker)
+            if stock_data and dividends is not None:
                 return render_template("stock.html", stock_data=stock_data, dividends=dividends)
             else:
-                error_message = f"No data found for ticker: {ticker.upper()}"
+                error_message = f"Info is not attainable for ticker: {ticker.upper()}"
                 return render_template("home.html", error_message=error_message)
         
         elif action == "graph":
@@ -174,24 +180,20 @@ def home():
 # Route for graph
 @app.route("/graph/<timeframe>", methods=["GET", "POST"])
 def graph(timeframe):
-    # Get the ticker from the form or query parameters
-    ticker = request.args.get("ticker") or request.form.get("ticker")
+    ticker = request.args.get("ticker")
     
-    # If no ticker is provided, return an error message
     if not ticker:
         error_message = "Please provide a stock ticker to generate the graph."
         return render_template("home.html", error_message=error_message)
     
-    # Convert the ticker to uppercase
     ticker = ticker.upper()
-    
-    # Generate the graph for the provided ticker and timeframe
     graph_url = generate_graph_yf(ticker, timeframe)
     if graph_url:
         return render_template("graph.html", graph_url=graph_url, ticker=ticker, timeframe=timeframe)
     else:
         error_message = f"Failed to generate graph for {ticker}."
         return render_template("home.html", error_message=error_message)
+
 
 
 

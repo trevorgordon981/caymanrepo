@@ -4,6 +4,13 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>StockPicker - Home</title>
+    <script>
+        // Dynamically update form action based on selected timeframe
+        function updateFormAction(form) {
+            const timeframe = form.timeframe.value;
+            form.action = `/graph/${timeframe}`;
+        }
+    </script>
 </head>
 <body>
     <h1>StockPicker</h1>
@@ -17,7 +24,7 @@
     <br><br>
     
     <!-- Form for Generating Graph -->
-    <form method="GET" action="/graph/">
+    <form method="GET" onsubmit="updateFormAction(this)">
         <input type="text" name="ticker" placeholder="Enter stock ticker" required>
         <label for="timeframe">Select Timeframe for Graph:</label>
         <select name="timeframe">
@@ -37,4 +44,5 @@
     {% endif %}
 </body>
 </html>
+
 
