@@ -1,7 +1,17 @@
+from flask import Flask, render_template, request
+import requests
+import os
+from jinja2 import Environment, FileSystemLoader
 import matplotlib.pyplot as plt
 import pandas as pd
 from io import BytesIO
 import base64
+
+# Initialize Flask app
+app = Flask(__name__, template_folder="templates")
+
+# Alpha Vantage API key (replace with your own)
+API_KEY = "GTU4V5Y3SCLWFC2C"
 
 # Function to get historical data for the graph
 def get_historical_data(ticker, outputsize="compact"):
@@ -64,6 +74,14 @@ def generate_graph(ticker, timeframe):
     plt.close()
     return graph_url
 
+# Home route
+@app.route("/", methods=["GET", "POST"])
+def home():
+    if request.method == "POST":
+        ticker = request.form["ticker"]
+        return render_template("stock.html", ticker=ticker)
+    return render_template("home.html")
+
 # Route for graph
 @app.route("/graph/<timeframe>", methods=["GET"])
 def graph(timeframe):
@@ -74,3 +92,7 @@ def graph(timeframe):
     else:
         error_message = f"Failed to generate graph for {ticker.upper()}."
         return render_template("home.html", error_message=error_message)
+
+# Run the app
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=8080, debug=True)
