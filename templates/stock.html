@@ -7,30 +7,25 @@
 </head>
 <body>
     <h1>Stock Data</h1>
-    <p><strong>Symbol:</strong> {{ stock_data['symbol'] }}</p>
-    <p><strong>Price:</strong> ${{ stock_data['price'] }}</p>
-    <p><strong>50-Day Moving Average:</strong> ${{ stock_data['50_day'] }}</p>
-    <p><strong>200-Day Moving Average:</strong> ${{ stock_data['200_day'] }}</p>
+    <p>Symbol: {{ stock_data['symbol'] }}</p>
+    <p>Price: ${{ stock_data['price'] }}</p>
+    <p>50-Day Moving Average: ${{ stock_data['50_day'] }}</p>
+    <p>200-Day Moving Average: ${{ stock_data['200_day'] }}</p>
 
     <h2>Recent Dividends</h2>
-    {% if dividends.empty %}
-        <p>No dividend data available for this stock.</p>
-    {% else %}
-        <table border="1">
-            <tr>
-                <th>Date</th>
-                <th>Dividend</th>
-            </tr>
-            {% for index, row in dividends.iterrows() %}
-            <tr>
-                <td>{{ row['Date'].strftime('%Y-%m-%d') }}</td>
-                <td>${{ row['Dividend'] }}</td>
-            </tr>
-            {% endfor %}
-        </table>
-    {% endif %}
+    <table border="1">
+        <tr>
+            <th>Date</th>
+            <th>Dividend</th>
+        </tr>
+        {% for index, row in dividends.iterrows() %}
+        <tr>
+            <td>{{ row['Date'].strftime('%Y-%m-%d') }}</td>
+            <td>${{ row['Dividend'] }}</td>
+        </tr>
+        {% endfor %}
+    </table>
 
-    <br>
     <a href="/">Go back</a>
 </body>
 </html>
