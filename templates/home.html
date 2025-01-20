@@ -23,22 +23,6 @@
     
     <br><br>
     
-    <!-- Form for Generating Graph -->
-    <form method="GET" onsubmit="updateFormAction(this)">
-        <input type="text" name="ticker" placeholder="Enter stock ticker" required>
-        <label for="timeframe">Select Timeframe for Graph:</label>
-        <select name="timeframe">
-            <option value="5 days">5 Days</option>
-            <option value="1 month">1 Month</option>
-            <option value="6 months">6 Months</option>
-            <option value="1 year">1 Year</option>
-            <option value="2 years">2 Years</option>
-            <option value="5 years">5 Years</option>
-            <option value="10 years">10 Years</option>
-        </select>
-        <button type="submit">Generate Graph</button>
-    </form>
-    
     {% if error_message %}
         <p style="color:
             red;">{{ error_message }}</p>
