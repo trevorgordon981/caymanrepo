@@ -1,21 +1,18 @@
 from flask import Flask, render_template, request
 import yfinance as yf
 import pandas as pd
-import matplotlib.pyplot as plt
-from io import BytesIO
-import base64
 
 # Initialize Flask app
 app = Flask(__name__, template_folder="templates")
 
-# Function to get stock data and optionally generate a graph
-def get_stock_data(ticker, generate_graph=False, period="1y"):
+# Function to get stock data
+def get_stock_data(ticker, period="1y"):
     try:
         stock = yf.Ticker(ticker)
         data = stock.history(period=period)
 
         if data.empty:
-            return None, None if generate_graph else None
+            return None
 
         # Calculate moving averages
         data['50_day_ma'] = data['Close'].rolling(window=50).mean()
@@ -28,32 +25,11 @@ def get_stock_data(ticker, generate_graph=False, period="1y"):
             '200_day_ma': f"{data['200_day_ma'].iloc[-1]:.2f}" if not pd.isna(data['200_day_ma'].iloc[-1]) else "N/A"
         }
 
-        if generate_graph:
-            # Plot the stock data
-            plt.figure(figsize=(10, 5))
-            plt.plot(data.index, data['Close'], label="Closing Price", color="blue")
-            plt.plot(data.index, data['50_day_ma'], label="50-Day MA", color="green")
-            plt.plot(data.index, data['200_day_ma'], label="200-Day MA", color="red")
-            plt.title(f"{ticker.upper()} Stock Price ({period})")
-            plt.xlabel("Date")
-            plt.ylabel("Price (USD)")
-            plt.legend()
-            plt.grid()
-
-            # Convert the plot to a PNG image and encode it
-            img = BytesIO()
-            plt.savefig(img, format="png")
-            img.seek(0)
-            graph_url = base64.b64encode(img.getvalue()).decode()
-            plt.close()
-
-            return stock_info, graph_url
-
         return stock_info
 
     except Exception as e:
         print(f"Error fetching data for {ticker}: {e}")
-        return None, None if generate_graph else None
+        return None
 
 
 # Home route
@@ -61,9 +37,9 @@ def get_stock_data(ticker, generate_graph=False, period="1y"):
 def home():
     if request.method == "POST":
         ticker = request.form["ticker"].strip()
-        stock_data, graph_url = get_stock_data(ticker, generate_graph=True)
+        stock_data = get_stock_data(ticker)
         if stock_data:
-            return render_template("graph.html", ticker=ticker, graph_url=graph_url, timeframe="1 Year")
+            return render_template("stock.html", stock_data=stock_data)
         else:
             error_message = f"Info is not attainable for ticker: {ticker.upper()}"
             return render_template("home.html", error_message=error_message)
