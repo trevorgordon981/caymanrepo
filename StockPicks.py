@@ -14,6 +14,10 @@ def get_stock_data(ticker, period="1y"):
         if data.empty:
             return None
 
+        # Ensure required columns exist
+        if 'Dividends' not in data.columns:
+            data['Dividends'] = 0  # Add a default column to avoid errors
+
         # Calculate moving averages
         data['50_day_ma'] = data['Close'].rolling(window=50).mean()
         data['200_day_ma'] = data['Close'].rolling(window=200).mean()
@@ -22,10 +26,16 @@ def get_stock_data(ticker, period="1y"):
             'symbol': ticker.upper(),
             'price': f"{data['Close'].iloc[-1]:.2f}",
             '50_day_ma': f"{data['50_day_ma'].iloc[-1]:.2f}" if not pd.isna(data['50_day_ma'].iloc[-1]) else "N/A",
-            '200_day_ma': f"{data['200_day_ma'].iloc[-1]:.2f}" if not pd.isna(data['200_day_ma'].iloc[-1]) else "N/A"
+            '200_day_ma': f"{data['200_day_ma'].iloc[-1]:.2f}" if not pd.isna(data['200_day_ma'].iloc[-1]) else "N/A",
+            'dividends': f"{data['Dividends'].sum():.2f}"  # Sum dividends over the period
         }
 
         return stock_info
+
+    except Exception as e:
+        print(f"Error fetching data for {ticker}: {e}")
+        return None
+
 
     except Exception as e:
         print(f"Error fetching data for {ticker}: {e}")
