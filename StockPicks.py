@@ -8,30 +8,52 @@ import base64
 # Initialize Flask app
 app = Flask(__name__, template_folder="templates")
 
-# Function to get stock data with moving averages
-def get_stock_data_with_moving_averages(ticker):
+# Function to get stock data and optionally generate a graph
+def get_stock_data(ticker, generate_graph=False, period="1y"):
     try:
         stock = yf.Ticker(ticker)
-        data = stock.history(period="1y")  # Fetch past 1 year's data
+        data = stock.history(period=period)
 
         if data.empty:
-            return None
+            return None, None if generate_graph else None
 
-        # Calculate 50-day and 200-day moving averages
+        # Calculate moving averages
         data['50_day_ma'] = data['Close'].rolling(window=50).mean()
         data['200_day_ma'] = data['Close'].rolling(window=200).mean()
 
-        # Get the latest price and moving averages
-        latest_data = data.iloc[-1]
-        return {
+        stock_info = {
             'symbol': ticker.upper(),
-            'price': f"{latest_data['Close']:.2f}",
-            '50_day_ma': f"{latest_data['50_day_ma']:.2f}" if not pd.isna(latest_data['50_day_ma']) else "N/A",
-            '200_day_ma': f"{latest_data['200_day_ma']:.2f}" if not pd.isna(latest_data['200_day_ma']) else "N/A"
+            'price': f"{data['Close'].iloc[-1]:.2f}",
+            '50_day_ma': f"{data['50_day_ma'].iloc[-1]:.2f}" if not pd.isna(data['50_day_ma'].iloc[-1]) else "N/A",
+            '200_day_ma': f"{data['200_day_ma'].iloc[-1]:.2f}" if not pd.isna(data['200_day_ma'].iloc[-1]) else "N/A"
         }
+
+        if generate_graph:
+            # Plot the stock data
+            plt.figure(figsize=(10, 5))
+            plt.plot(data.index, data['Close'], label="Closing Price", color="blue")
+            plt.plot(data.index, data['50_day_ma'], label="50-Day MA", color="green")
+            plt.plot(data.index, data['200_day_ma'], label="200-Day MA", color="red")
+            plt.title(f"{ticker.upper()} Stock Price ({period})")
+            plt.xlabel("Date")
+            plt.ylabel("Price (USD)")
+            plt.legend()
+            plt.grid()
+
+            # Convert the plot to a PNG image and encode it
+            img = BytesIO()
+            plt.savefig(img, format="png")
+            img.seek(0)
+            graph_url = base64.b64encode(img.getvalue()).decode()
+            plt.close()
+
+            return stock_info, graph_url
+
+        return stock_info
+
     except Exception as e:
         print(f"Error fetching data for {ticker}: {e}")
-        return None
+        return None, None if generate_graph else None
 
 
 # Home route
@@ -39,9 +61,9 @@ def get_stock_data_with_moving_averages(ticker):
 def home():
     if request.method == "POST":
         ticker = request.form["ticker"].strip()
-        stock_data = get_stock_data_with_moving_averages(ticker)
+        stock_data, graph_url = get_stock_data(ticker, generate_graph=True)
         if stock_data:
-            return render_template("stock.html", stock_data=stock_data)
+            return render_template("graph.html", ticker=ticker, graph_url=graph_url, timeframe="1 Year")
         else:
             error_message = f"Info is not attainable for ticker: {ticker.upper()}"
             return render_template("home.html", error_message=error_message)
