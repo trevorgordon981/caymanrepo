@@ -1,1299 +1,767 @@
+#!/usr/bin/env python3
 """
-Enhanced Stock Ticker Analysis App with Multi-Brokerage Import Support
-Supports: Charles Schwab, Fidelity, E*TRADE, Robinhood, TD Ameritrade/thinkorswim
-
-pip install requests pandas numpy matplotlib yfinance tabulate colorama
+STOCK TICKER APP v7.7.0 — Live Portfolio Tracking
+INSTALL: pip install yfinance pandas numpy matplotlib tabulate colorama requests scipy
 """
-
-import requests
+from __future__ import annotations
+import os, re, sys, json, time, math, shlex, logging, warnings
+from dataclasses import dataclass, field
+from datetime import datetime
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
+warnings.filterwarnings("ignore")
 import pandas as pd
 import numpy as np
-import matplotlib.pyplot as plt
-from datetime import datetime, timedelta
-from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Tuple, Any
-from abc import ABC, abstractmethod
-import time
-import json
-import warnings
-import os
-import re
-from pathlib import Path
-from concurrent.futures import ThreadPoolExecutor, as_completed
+import requests
+logging.getLogger("yfinance").setLevel(logging.CRITICAL)
+logging.getLogger("urllib3").setLevel(logging.CRITICAL)
+logging.getLogger("requests").setLevel(logging.CRITICAL)
+import yfinance as yf
 
-warnings.filterwarnings('ignore')
+try:
+    from scipy.stats import norm
+    HAS_SCIPY = True
+except ImportError:
+    HAS_SCIPY = False
 
-# Optional imports with fallbacks
+try:
+    import matplotlib.pyplot as plt
+    HAS_MATPLOTLIB = True
+except:
+    HAS_MATPLOTLIB = False
+
 try:
     from tabulate import tabulate
 except ImportError:
     def tabulate(data, headers=None, tablefmt="simple"):
+        if not data: return ""
         lines = []
         if headers:
             lines.append(" | ".join(str(h) for h in headers))
-            lines.append("-" * 60)
+            lines.append("-" * 80)
         for row in data:
             lines.append(" | ".join(str(c) for c in row))
         return "\n".join(lines)
 
 try:
-    from colorama import init, Fore, Style
-    init(autoreset=True)
+    from colorama import init as _ci, Fore, Style
+    _ci(autoreset=True)
 except ImportError:
     class Fore:
-        GREEN = RED = YELLOW = MAGENTA = CYAN = WHITE = BLUE = RESET = ''
+        GREEN = RED = YELLOW = MAGENTA = CYAN = WHITE = BLUE = RESET = ""
     class Style:
-        RESET_ALL = BRIGHT = ''
+        RESET_ALL = BRIGHT = ""
 
+COMPANY_TO_TICKER = {
+    'PURECYCLE TECHNOLOGIES INC COM': 'PCT', 'PURECYCLE TECHNOLOGIES INC': 'PCT',
+    'APPLE INC COM': 'AAPL', 'APPLE INC': 'AAPL',
+    'MICROSOFT CORP COM': 'MSFT', 'MICROSOFT CORP': 'MSFT',
+    'TESLA INC COM': 'TSLA', 'TESLA INC': 'TSLA',
+    'NVIDIA CORP COM': 'NVDA', 'NVIDIA CORP': 'NVDA',
+    'AMAZON COM INC COM': 'AMZN', 'AMAZON COM INC': 'AMZN',
+    'ALPHABET INC CL A': 'GOOGL', 'ALPHABET INC CL C': 'GOOG',
+    'META PLATFORMS INC CL A': 'META', 'META PLATFORMS INC': 'META',
+    'PALANTIR TECHNOLOGIES INC CL A': 'PLTR', 'PALANTIR TECHNOLOGIES INC': 'PLTR',
+    'ADVANCED MICRO DEVICES INC': 'AMD',
+    'INTEL CORP COM': 'INTC', 'INTEL CORP': 'INTC',
+    'COINBASE GLOBAL INC CL A': 'COIN', 'ROBINHOOD MARKETS INC CL A': 'HOOD',
+    'SOFI TECHNOLOGIES INC COM': 'SOFI', 'SOFI TECHNOLOGIES INC': 'SOFI',
+    'ROCKET LAB USA INC COM': 'RKLB', 'ROCKET LAB USA INC': 'RKLB',
+    'ARCHER AVIATION INC CL A': 'ACHR', 'JOBY AVIATION INC': 'JOBY',
+    'AST SPACEMOBILE INC CL A': 'ASTS', 'OKLO INC CL A': 'OKLO',
+    'CARVANA CO CL A': 'CVNA', 'UBER TECHNOLOGIES INC COM': 'UBER',
+    'REDDIT INC CL A': 'RDDT', 'MICRON TECHNOLOGY INC COM': 'MU',
+}
 
-# =============================================================================
-# CONFIGURATION
-# =============================================================================
+def _now(): return time.time()
+def today_str(): return datetime.now().strftime("%Y-%m-%d")
+
+def safe_float(val, default=0.0):
+    if val is None: return default
+    if isinstance(val, (int, float)):
+        if isinstance(val, float) and (math.isnan(val) or math.isinf(val)): return default
+        return float(val)
+    try:
+        s = str(val).strip().replace(",", "").replace("$", "").replace('"', "").replace("%", "")
+        if s in ("", "--", "N/A", "nan", "None", "-", "NaN"): return default
+        if s.startswith("(") and s.endswith(")"): s = "-" + s[1:-1]
+        return float(s)
+    except: return default
+
+def fmt_money(x, sign=False): return f"${x:+,.2f}" if sign else f"${x:,.2f}"
+def fmt_pct(x, sign=False): return f"{x:+.2f}%" if sign else f"{x:.2f}%"
+def color_money(x, sign=True): return (Fore.GREEN if x >= 0 else Fore.RED) + fmt_money(x, sign=sign) + Style.RESET_ALL
+def color_pct(x, sign=True): return (Fore.GREEN if x >= 0 else Fore.RED) + fmt_pct(x, sign=sign) + Style.RESET_ALL
+def color_pnl(pnl, pnl_pct): return f"{color_money(pnl)} ({color_pct(pnl_pct)})"
+
+def color_signal(signal):
+    s = str(signal).upper()
+    if "BUY" in s or "BULL" in s or "OVERSOLD" in s: return Fore.GREEN + s + Style.RESET_ALL
+    if "SELL" in s or "BEAR" in s or "OVERBOUGHT" in s: return Fore.RED + s + Style.RESET_ALL
+    return Fore.YELLOW + s + Style.RESET_ALL
+
+def normalize_symbol(s):
+    s = str(s).strip().upper()
+    s = re.sub(r"[^A-Z0-9\.\-\^\=\:]", "", s)
+    return s.replace(".", "-") if re.match(r"^[A-Z]+\.[A-Z]$", s) else s
+
+def parse_date(d):
+    d = str(d).strip()
+    for fmt in ["%Y-%m-%d", "%m/%d/%Y", "%m-%d-%Y", "%Y%m%d"]:
+        try: return datetime.strptime(d, fmt).strftime("%Y-%m-%d")
+        except: pass
+    return d
+
+def dte(expiry):
+    try:
+        exp_dt = datetime.strptime(str(expiry), "%Y-%m-%d")
+        today = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
+        return (exp_dt - today).days
+    except: return 0
+
+def warn(msg): print(Fore.YELLOW + "⚠ " + msg + Style.RESET_ALL)
+def err(msg): print(Fore.RED + "✗ " + msg + Style.RESET_ALL)
+def success(msg): print(Fore.GREEN + "✓ " + msg + Style.RESET_ALL)
+
+class ProgressBar:
+    def __init__(self, total, prefix="", width=30):
+        self.total = max(total, 1)
+        self.prefix = prefix
+        self.width = width
+        self.current = 0
+        self.start = _now()
+        self._last = 0
+    def update(self, current=None, suffix=""):
+        self.current = current if current is not None else self.current + 1
+        pct = min(self.current / self.total, 1.0)
+        filled = int(self.width * pct)
+        bar = "█" * filled + "░" * (self.width - filled)
+        elapsed = _now() - self.start
+        eta = f"{elapsed/pct*(1-pct):.0f}s" if 0 < pct < 1 else ""
+        line = f"\r{self.prefix}|{bar}| {self.current}/{self.total} {eta} {suffix[:15]}"
+        print(line + " " * max(0, self._last - len(line)), end="", flush=True)
+        self._last = len(line)
+    def done(self):
+        elapsed = _now() - self.start
+        print(f"\r{self.prefix}|{'█'*self.width}| {self.total}/{self.total} done in {elapsed:.1f}s" + " "*20)
 
 @dataclass
 class Config:
-    show_charts: bool = True
-    save_charts: bool = False
-    theme: str = 'dark'
-    cache_duration: int = 300
-    max_concurrent_requests: int = 5
     data_dir: str = field(default_factory=lambda: os.path.expanduser("~/.stockticker"))
-    
-    def __post_init__(self):
-        os.makedirs(self.data_dir, exist_ok=True)
-    
-    def get_path(self, filename: str) -> str:
-        return os.path.join(self.data_dir, filename)
+    risk_free_rate: float = 0.043
+    theme: str = "dark"
+    debug: bool = False
+    show_charts: bool = True
+    def __post_init__(self): Path(self.data_dir).mkdir(parents=True, exist_ok=True)
+    @classmethod
+    def load(cls):
+        cfg = cls()
+        p = Path(os.path.expanduser("~/.stockticker")) / "config.json"
+        if p.exists():
+            try:
+                for k, v in json.loads(p.read_text()).items():
+                    if hasattr(cfg, k): setattr(cfg, k, v)
+            except: pass
+        cfg.__post_init__()
+        return cfg
+    def save(self):
+        p = Path(self.data_dir) / "config.json"
+        p.write_text(json.dumps({'theme': self.theme, 'debug': self.debug, 'show_charts': self.show_charts, 'risk_free_rate': self.risk_free_rate}, indent=2))
 
+config = Config.load()
 
-config = Config()
-
-
-# =============================================================================
-# PRICE CACHE
-# =============================================================================
-
-class PriceCache:
-    def __init__(self, cache_duration: int = 300):
-        self.cache: Dict[str, Tuple[float, float]] = {}
-        self.cache_duration = cache_duration
-        self.last_api_call = 0
-        self.min_delay = 0.5  # Increased from 0.3 to avoid rate limiting
-
-    def get(self, symbol: str) -> Optional[float]:
-        symbol = symbol.upper()
-        if symbol in self.cache:
-            timestamp, price = self.cache[symbol]
-            if time.time() - timestamp < self.cache_duration:
-                return price
-        return None
-
-    def set(self, symbol: str, price: float):
-        if price is not None:
-            self.cache[symbol.upper()] = (time.time(), price)
-
-    def wait_for_rate_limit(self):
-        elapsed = time.time() - self.last_api_call
-        if elapsed < self.min_delay:
-            time.sleep(self.min_delay - elapsed)
-        self.last_api_call = time.time()
-
-    def clear(self):
-        self.cache.clear()
-
-
-price_cache = PriceCache()
-
-
-# =============================================================================
-# BROKERAGE CSV PARSERS
-# =============================================================================
-
-class BrokerageParser(ABC):
-    """Abstract base class for brokerage CSV parsers"""
-    name: str = "Unknown"
-    
-    @abstractmethod
-    def can_parse(self, headers: List[str], content: str) -> bool:
-        pass
-    
-    @abstractmethod
-    def parse(self, filepath: str) -> Tuple[Dict, Dict, float]:
-        pass
-    
+class BlackScholes:
     @staticmethod
-    def clean_number(val: Any) -> float:
-        if val is None or val == '' or val == '--':
-            return 0.0
-        clean = str(val).replace(',', '').replace('$', '').replace('"', '').replace('(', '-').replace(')', '').strip()
+    def price(S, K, T, r, sigma, option_type='call'):
+        if not HAS_SCIPY or T <= 0 or sigma <= 0 or S <= 0: return 0.0
         try:
-            return float(clean) if clean and clean != '-' else 0.0
-        except ValueError:
-            return 0.0
-    
+            d1 = (math.log(S / K) + (r + 0.5 * sigma ** 2) * T) / (sigma * math.sqrt(T))
+            d2 = d1 - sigma * math.sqrt(T)
+            if option_type.lower() == 'call':
+                return max(0, S * norm.cdf(d1) - K * math.exp(-r * T) * norm.cdf(d2))
+            return max(0, K * math.exp(-r * T) * norm.cdf(-d2) - S * norm.cdf(-d1))
+        except: return 0.0
     @staticmethod
-    def parse_csv_line(line: str) -> List[str]:
-        fields, current, in_quotes = [], '', False
-        for char in line:
-            if char == '"':
-                in_quotes = not in_quotes
-            elif char == ',' and not in_quotes:
-                fields.append(current.strip())
-                current = ''
-            else:
-                current += char
-        fields.append(current.strip())
-        return fields
+    def delta(S, K, T, r, sigma, option_type='call'):
+        if not HAS_SCIPY or T <= 0 or sigma <= 0: return 0.5 if option_type == 'call' else -0.5
+        try:
+            d1 = (math.log(S / K) + (r + 0.5 * sigma ** 2) * T) / (sigma * math.sqrt(T))
+            return norm.cdf(d1) if option_type.lower() == 'call' else norm.cdf(d1) - 1
+        except: return 0.5 if option_type == 'call' else -0.5
+    @staticmethod
+    def gamma(S, K, T, r, sigma):
+        if not HAS_SCIPY or T <= 0 or sigma <= 0 or S <= 0: return 0.0
+        try:
+            d1 = (math.log(S / K) + (r + 0.5 * sigma ** 2) * T) / (sigma * math.sqrt(T))
+            return norm.pdf(d1) / (S * sigma * math.sqrt(T))
+        except: return 0.0
+    @staticmethod
+    def vega(S, K, T, r, sigma):
+        if not HAS_SCIPY or T <= 0 or sigma <= 0: return 0.0
+        try:
+            d1 = (math.log(S / K) + (r + 0.5 * sigma ** 2) * T) / (sigma * math.sqrt(T))
+            return S * norm.pdf(d1) * math.sqrt(T) / 100
+        except: return 0.0
+    @staticmethod
+    def theta(S, K, T, r, sigma, option_type='call'):
+        if not HAS_SCIPY or T <= 0 or sigma <= 0: return 0.0
+        try:
+            d1 = (math.log(S / K) + (r + 0.5 * sigma ** 2) * T) / (sigma * math.sqrt(T))
+            d2 = d1 - sigma * math.sqrt(T)
+            term1 = -S * norm.pdf(d1) * sigma / (2 * math.sqrt(T))
+            term2 = -r * K * math.exp(-r * T) * norm.cdf(d2) if option_type.lower() == 'call' else r * K * math.exp(-r * T) * norm.cdf(-d2)
+            return (term1 + term2) / 365
+        except: return 0.0
+    @staticmethod
+    def rho(S, K, T, r, sigma, option_type='call'):
+        if not HAS_SCIPY or T <= 0 or sigma <= 0: return 0.0
+        try:
+            d2 = (math.log(S / K) + (r - 0.5 * sigma ** 2) * T) / (sigma * math.sqrt(T))
+            if option_type.lower() == 'call': return K * T * math.exp(-r * T) * norm.cdf(d2) / 100
+            return -K * T * math.exp(-r * T) * norm.cdf(-d2) / 100
+        except: return 0.0
+    @staticmethod
+    def implied_volatility(price, S, K, T, r, option_type='call', max_iter=100, tol=0.0001):
+        if not HAS_SCIPY or price <= 0 or T <= 0 or S <= 0: return 0.5
+        sigma = max(0.1, min(math.sqrt(2 * math.pi / T) * price / S, 2.0))
+        for _ in range(max_iter):
+            try:
+                bs_price = BlackScholes.price(S, K, T, r, sigma, option_type)
+                vega = BlackScholes.vega(S, K, T, r, sigma) * 100
+                if vega < 1e-10: break
+                diff = bs_price - price
+                if abs(diff) < tol: break
+                sigma = max(0.01, min(sigma - diff / vega, 5.0))
+            except: break
+        return sigma
+    @staticmethod
+    def calculate_all_greeks(S, K, T, r, sigma, option_type='call'):
+        return {'delta': BlackScholes.delta(S, K, T, r, sigma, option_type), 'gamma': BlackScholes.gamma(S, K, T, r, sigma), 'theta': BlackScholes.theta(S, K, T, r, sigma, option_type), 'vega': BlackScholes.vega(S, K, T, r, sigma), 'rho': BlackScholes.rho(S, K, T, r, sigma, option_type)}
 
-
-class FidelityParser(BrokerageParser):
-    name = "Fidelity"
-    
-    def can_parse(self, headers: List[str], content: str) -> bool:
-        hl = [h.lower() for h in headers]
-        return 'symbol' in hl and 'quantity' in hl and any('cost basis' in h for h in hl)
-    
-    def parse(self, filepath: str) -> Tuple[Dict, Dict, float]:
-        stocks, options, cash = {}, {}, 0.0
-        
-        with open(filepath, 'r', encoding='utf-8-sig') as f:
-            lines = f.readlines()
-        
-        header_idx = next((i for i, l in enumerate(lines) if 'Symbol' in l and 'Quantity' in l), 0)
-        headers = [h.strip().lower() for h in lines[header_idx].split(',')]
-        
-        col_map = {}
-        for i, h in enumerate(headers):
-            if h == 'symbol': col_map['symbol'] = i
-            elif h == 'description': col_map['desc'] = i
-            elif h == 'quantity': col_map['qty'] = i
-            elif 'cost basis total' in h: col_map['cost'] = i
-            elif 'average cost basis' in h: col_map['avg_cost'] = i
-            elif h == 'current value': col_map['value'] = i
-            elif 'total gain/loss dollar' in h: col_map['gl'] = i
-        
-        skip_terms = ['MONEY MARKET', 'SPAXX', 'FCASH', 'FDRXX', 'PENDING', 'CORE', 'CASH']
-        
-        for line in lines[header_idx + 1:]:
-            fields = self.parse_csv_line(line)
-            if len(fields) < 5:
-                continue
-            
-            symbol = fields[col_map.get('symbol', 0)].strip().upper()
-            desc = fields[col_map.get('desc', 1)].strip().upper() if 'desc' in col_map else ''
-            
-            if not symbol or any(s in f"{symbol} {desc}" for s in skip_terms):
-                continue
-            
-            qty = self.clean_number(fields[col_map.get('qty', 2)])
-            if qty == 0:
-                continue
-            
-            cost_total = abs(self.clean_number(fields[col_map.get('cost', -1)])) if 'cost' in col_map else 0
-            avg_cost = abs(self.clean_number(fields[col_map.get('avg_cost', -1)])) if 'avg_cost' in col_map else 0
-            value = self.clean_number(fields[col_map.get('value', -1)]) if 'value' in col_map else 0
-            gl = self.clean_number(fields[col_map.get('gl', -1)]) if 'gl' in col_map else 0
-            
-            if 'CALL' in desc or 'PUT' in desc:
-                opt = self._parse_option(desc, qty, cost_total, avg_cost, value, gl)
-                if opt:
-                    options[opt['id']] = opt['data']
-            else:
-                if avg_cost == 0 and cost_total > 0 and qty > 0:
-                    avg_cost = cost_total / qty
-                stocks[symbol] = {'shares': qty, 'cost_basis': avg_cost, 'current_value': value, 'total_gl': gl}
-        
-        return stocks, options, cash
-    
-    def _parse_option(self, desc: str, qty: float, cost: float, avg: float, value: float, gl: float) -> Optional[Dict]:
-        months = {'JAN':1,'FEB':2,'MAR':3,'APR':4,'MAY':5,'JUN':6,'JUL':7,'AUG':8,'SEP':9,'OCT':10,'NOV':11,'DEC':12}
-        words = desc.split()
-        if len(words) < 5:
-            return None
-        
-        underlying = ''.join(c for c in words[0] if c.isalpha())[:5]
-        if not underlying:
-            return None
-        
-        otype = 'call' if 'CALL' in desc else 'put'
-        expiry = None
-        for i, w in enumerate(words):
-            if w in months and i + 2 < len(words):
-                try:
-                    mon, day = months[w], int(words[i+1].replace(',', ''))
-                    yr = int(words[i+2].replace(',', ''))
-                    yr = yr + 2000 if yr < 100 else yr
-                    expiry = f"{yr}-{mon:02d}-{day:02d}"
-                    break
-                except ValueError:
-                    continue
-        
-        if not expiry:
-            return None
-        
-        match = re.search(r'\$(\d+(?:\.\d+)?)', desc)
-        strike = float(match.group(1)) if match else 0
-        if strike == 0:
-            return None
-        
-        contracts = int(abs(qty))
-        if contracts == 0:
-            return None
-        
-        premium = avg if avg > 0 else (cost / (contracts * 100) if cost > 0 else 0.01)
-        
-        return {
-            'id': f"{underlying}_{expiry}_{otype[0].upper()}{int(strike)}",
-            'data': {
-                'symbol': underlying, 'type': otype, 'strike': strike, 'expiration': expiry,
-                'contracts': contracts, 'premium': premium, 'position_type': 'long' if qty > 0 else 'short',
-                'total_cost': cost, 'current_value': value, 'total_gl': gl
-            }
+class TechnicalAnalysis:
+    @staticmethod
+    def sma(data, period): return data.rolling(window=period).mean()
+    @staticmethod
+    def ema(data, period): return data.ewm(span=period, adjust=False).mean()
+    @staticmethod
+    def wma(data, period):
+        weights = np.arange(1, period + 1)
+        return data.rolling(period).apply(lambda x: np.dot(x, weights) / weights.sum(), raw=True)
+    @staticmethod
+    def rsi(data, period=14):
+        delta = data.diff()
+        gain = (delta.where(delta > 0, 0)).ewm(alpha=1/period, adjust=False).mean()
+        loss = (-delta.where(delta < 0, 0)).ewm(alpha=1/period, adjust=False).mean()
+        return 100 - (100 / (1 + gain / loss.replace(0, np.nan)))
+    @staticmethod
+    def macd(data, fast=12, slow=26, signal=9):
+        ema_fast = data.ewm(span=fast, adjust=False).mean()
+        ema_slow = data.ewm(span=slow, adjust=False).mean()
+        macd_line = ema_fast - ema_slow
+        signal_line = macd_line.ewm(span=signal, adjust=False).mean()
+        return macd_line, signal_line, macd_line - signal_line
+    @staticmethod
+    def bollinger_bands(data, period=20, std_dev=2.0):
+        middle = data.rolling(period).mean()
+        std = data.rolling(period).std()
+        return middle + (std * std_dev), middle, middle - (std * std_dev)
+    @staticmethod
+    def atr(df, period=14):
+        tr = pd.concat([df['High'] - df['Low'], (df['High'] - df['Close'].shift()).abs(), (df['Low'] - df['Close'].shift()).abs()], axis=1).max(axis=1)
+        return tr.rolling(period).mean()
+    @staticmethod
+    def supertrend(df, period=10, multiplier=3):
+        atr = TechnicalAnalysis.atr(df, period)
+        hl2 = (df['High'] + df['Low']) / 2
+        basic_upper = hl2 + (multiplier * atr)
+        basic_lower = hl2 - (multiplier * atr)
+        close = df['Close']
+        final_upper = pd.Series(0.0, index=df.index)
+        final_lower = pd.Series(0.0, index=df.index)
+        trend = pd.Series(0, index=df.index)
+        for i in range(period, len(df)):
+            final_upper.iloc[i] = basic_upper.iloc[i] if basic_upper.iloc[i] < final_upper.iloc[i-1] or close.iloc[i-1] > final_upper.iloc[i-1] else final_upper.iloc[i-1]
+            final_lower.iloc[i] = basic_lower.iloc[i] if basic_lower.iloc[i] > final_lower.iloc[i-1] or close.iloc[i-1] < final_lower.iloc[i-1] else final_lower.iloc[i-1]
+            prev_trend = trend.iloc[i-1] if i > 0 else 1
+            trend.iloc[i] = -1 if prev_trend == 1 and close.iloc[i] < final_lower.iloc[i] else 1 if prev_trend == -1 and close.iloc[i] > final_upper.iloc[i] else prev_trend
+        return trend, final_upper, final_lower
+    @staticmethod
+    def stochastic(df, k_period=14, d_period=3):
+        low_min = df['Low'].rolling(window=k_period).min()
+        high_max = df['High'].rolling(window=k_period).max()
+        k = 100 * ((df['Close'] - low_min) / (high_max - low_min + 1e-9))
+        return k, k.rolling(window=d_period).mean()
+    @staticmethod
+    def ichimoku(df):
+        tenkan = (df['High'].rolling(9).max() + df['Low'].rolling(9).min()) / 2
+        kijun = (df['High'].rolling(26).max() + df['Low'].rolling(26).min()) / 2
+        senkou_a = ((tenkan + kijun) / 2).shift(26)
+        senkou_b = ((df['High'].rolling(52).max() + df['Low'].rolling(52).min()) / 2).shift(26)
+        return {'tenkan': tenkan, 'kijun': kijun, 'senkou_a': senkou_a, 'senkou_b': senkou_b, 'chikou': df['Close'].shift(-26)}
+    @staticmethod
+    def mfi(df, period=14):
+        tp = (df['High'] + df['Low'] + df['Close']) / 3
+        mf = tp * df['Volume']
+        pos = mf.where(tp > tp.shift(), 0).rolling(period).sum()
+        neg = mf.where(tp < tp.shift(), 0).rolling(period).sum()
+        return 100 - (100 / (1 + pos / neg.replace(0, np.nan)))
+    @staticmethod
+    def cci(df, period=20):
+        tp = (df['High'] + df['Low'] + df['Close']) / 3
+        return (tp - tp.rolling(period).mean()) / (0.015 * tp.rolling(period).apply(lambda x: np.abs(x - x.mean()).mean()))
+    @staticmethod
+    def williams_r(df, period=14):
+        hh = df['High'].rolling(period).max()
+        ll = df['Low'].rolling(period).min()
+        return -100 * (hh - df['Close']) / (hh - ll)
+    @staticmethod
+    def adx(df, period=14):
+        plus_dm = df['High'].diff()
+        minus_dm = -df['Low'].diff()
+        plus_dm = plus_dm.where((plus_dm > minus_dm) & (plus_dm > 0), 0)
+        minus_dm = minus_dm.where((minus_dm > plus_dm) & (minus_dm > 0), 0)
+        atr = TechnicalAnalysis.atr(df, period)
+        plus_di = 100 * (plus_dm.ewm(span=period).mean() / atr)
+        minus_di = 100 * (minus_dm.ewm(span=period).mean() / atr)
+        dx = 100 * (plus_di - minus_di).abs() / (plus_di + minus_di)
+        return dx.ewm(span=period).mean(), plus_di, minus_di
+    @staticmethod
+    def obv(df):
+        obv = pd.Series(0.0, index=df.index)
+        obv.iloc[0] = df['Volume'].iloc[0]
+        for i in range(1, len(df)):
+            if df['Close'].iloc[i] > df['Close'].iloc[i-1]: obv.iloc[i] = obv.iloc[i-1] + df['Volume'].iloc[i]
+            elif df['Close'].iloc[i] < df['Close'].iloc[i-1]: obv.iloc[i] = obv.iloc[i-1] - df['Volume'].iloc[i]
+            else: obv.iloc[i] = obv.iloc[i-1]
+        return obv
+    @staticmethod
+    def vwap(df):
+        tp = (df['High'] + df['Low'] + df['Close']) / 3
+        return (tp * df['Volume']).cumsum() / df['Volume'].cumsum()
+    @staticmethod
+    def pivot_points(df):
+        h, l, c = df['High'].iloc[-1], df['Low'].iloc[-1], df['Close'].iloc[-1]
+        p = (h + l + c) / 3
+        return {'P': p, 'R1': 2*p-l, 'S1': 2*p-h, 'R2': p+(h-l), 'S2': p-(h-l), 'R3': h+2*(p-l), 'S3': l-2*(h-p)}
+    @staticmethod
+    def fibonacci(df, period=120):
+        h, l = df['High'].tail(period).max(), df['Low'].tail(period).min()
+        d = h - l
+        return {'0%': h, '23.6%': h-0.236*d, '38.2%': h-0.382*d, '50%': h-0.5*d, '61.8%': h-0.618*d, '78.6%': h-0.786*d, '100%': l}
+    @staticmethod
+    def analyze(df, symbol):
+        if df is None or len(df) < 30: return {'error': 'Insufficient Data'}
+        close = df['Close']
+        price = close.iloc[-1]
+        rsi = TechnicalAnalysis.rsi(close).iloc[-1]
+        _, _, hist = TechnicalAnalysis.macd(close)
+        supertrend, _, _ = TechnicalAnalysis.supertrend(df)
+        stoch_k, stoch_d = TechnicalAnalysis.stochastic(df)
+        mfi = TechnicalAnalysis.mfi(df).iloc[-1]
+        williams = TechnicalAnalysis.williams_r(df).iloc[-1]
+        cci = TechnicalAnalysis.cci(df).iloc[-1]
+        ichimoku = TechnicalAnalysis.ichimoku(df)
+        signals = {
+            'RSI': "OVERSOLD" if rsi < 30 else "OVERBOUGHT" if rsi > 70 else "Neutral",
+            'MACD': "BULLISH" if hist.iloc[-1] > 0 else "BEARISH",
+            'Supertrend': "BULLISH" if supertrend.iloc[-1] == 1 else "BEARISH",
+            'Stochastic': "OVERSOLD" if stoch_k.iloc[-1] < 20 else "OVERBOUGHT" if stoch_k.iloc[-1] > 80 else "Neutral",
+            'Williams %R': "OVERSOLD" if williams < -80 else "OVERBOUGHT" if williams > -20 else "Neutral",
+            'CCI': "OVERSOLD" if cci < -100 else "OVERBOUGHT" if cci > 100 else "Neutral",
+            'Ichimoku': "BULLISH" if ichimoku['tenkan'].iloc[-1] > ichimoku['kijun'].iloc[-1] and price > ichimoku['senkou_a'].iloc[-1] else "NEUTRAL/BEARISH",
+            'MFI': "OVERSOLD" if mfi < 20 else "OVERBOUGHT" if mfi > 80 else "Neutral"
         }
+        score = sum(1 if any(x in s for x in ["BULL","OVERSOLD"]) else -1 if any(x in s for x in ["BEAR","OVERBOUGHT"]) else 0 for s in signals.values())
+        return {'symbol': symbol, 'price': price, 'change_pct': (price - close.iloc[-2]) / close.iloc[-2] * 100 if len(close) >= 2 else 0, 'indicators': {'RSI': rsi, 'MFI': mfi, 'CCI': cci, 'Williams': williams, 'Stoch_K': stoch_k.iloc[-1], 'Stoch_D': stoch_d.iloc[-1]}, 'signals': signals, 'score': score}
 
-
-class SchwabParser(BrokerageParser):
-    name = "Charles Schwab"
-    
-    def can_parse(self, headers: List[str], content: str) -> bool:
-        hl = ','.join(h.lower() for h in headers)
-        return 'action' in hl and 'symbol' in hl and ('fees & comm' in hl or 'amount' in hl)
-    
-    def parse(self, filepath: str) -> Tuple[Dict, Dict, float]:
-        stocks, options, positions = {}, {}, {}
-        
-        with open(filepath, 'r', encoding='utf-8-sig') as f:
-            lines = f.readlines()
-        
-        header_idx = next((i for i, l in enumerate(lines) if 'Date' in l and 'Action' in l and 'Symbol' in l), 0)
-        headers = [h.strip() for h in lines[header_idx].split(',')]
-        hmap = {h.lower(): i for i, h in enumerate(headers)}
-        
-        for line in lines[header_idx + 1:]:
-            fields = self.parse_csv_line(line)
-            if len(fields) < 4:
-                continue
-            
-            action = fields[hmap.get('action', 1)].upper() if 'action' in hmap else ''
-            symbol = fields[hmap.get('symbol', 2)].strip().upper() if 'symbol' in hmap else ''
-            
-            if not symbol or not action or any(s in action for s in ['DIVIDEND', 'INTEREST', 'TRANSFER', 'JOURNAL', 'ADR']):
-                continue
-            
-            qty = abs(self.clean_number(fields[hmap.get('quantity', 3)])) if 'quantity' in hmap else 0
-            price = abs(self.clean_number(fields[hmap.get('price', 4)])) if 'price' in hmap else 0
-            
-            if qty == 0:
-                continue
-            
-            if symbol not in positions:
-                positions[symbol] = {'shares': 0, 'cost_total': 0}
-            
-            if any(b in action for b in ['BUY', 'REINVEST']):
-                positions[symbol]['shares'] += qty
-                positions[symbol]['cost_total'] += qty * price
-            elif 'SELL' in action:
-                positions[symbol]['shares'] -= qty
-        
-        for sym, pos in positions.items():
-            if pos['shares'] > 0.001:
-                stocks[sym] = {'shares': pos['shares'], 'cost_basis': pos['cost_total'] / pos['shares'] if pos['shares'] > 0 else 0, 'current_value': 0, 'total_gl': 0}
-        
-        return stocks, options, 0.0
-
-
-class ETRADEParser(BrokerageParser):
-    name = "E*TRADE"
-    
-    def can_parse(self, headers: List[str], content: str) -> bool:
-        hl = ','.join(h.lower() for h in headers)
-        return ('transactiontype' in hl or 'transaction type' in hl) and 'symbol' in hl
-    
-    def parse(self, filepath: str) -> Tuple[Dict, Dict, float]:
-        stocks, positions = {}, {}
-        
-        with open(filepath, 'r', encoding='utf-8-sig') as f:
-            lines = f.readlines()
-        
-        header_idx = next((i for i, l in enumerate(lines) if 'Symbol' in l), 0)
-        headers = [h.strip() for h in lines[header_idx].split(',')]
-        hmap = {h.lower().replace(' ', ''): i for i, h in enumerate(headers)}
-        
-        action_col = hmap.get('transactiontype', hmap.get('type', hmap.get('action', 1)))
-        symbol_col = hmap.get('symbol', 2)
-        qty_col = hmap.get('quantity', hmap.get('qty', 3))
-        price_col = hmap.get('price', 4)
-        
-        for line in lines[header_idx + 1:]:
-            fields = self.parse_csv_line(line)
-            if len(fields) < 4:
-                continue
-            
-            action = fields[action_col].upper() if action_col < len(fields) else ''
-            symbol = fields[symbol_col].strip().upper() if symbol_col < len(fields) else ''
-            qty = abs(self.clean_number(fields[qty_col])) if qty_col < len(fields) else 0
-            price = abs(self.clean_number(fields[price_col])) if price_col < len(fields) else 0
-            
-            if not symbol or qty == 0:
-                continue
-            
-            if symbol not in positions:
-                positions[symbol] = {'shares': 0, 'cost_total': 0}
-            
-            if 'BOUGHT' in action or 'BUY' in action:
-                positions[symbol]['shares'] += qty
-                positions[symbol]['cost_total'] += qty * price
-            elif 'SOLD' in action or 'SELL' in action:
-                positions[symbol]['shares'] -= qty
-        
-        for sym, pos in positions.items():
-            if pos['shares'] > 0.001:
-                stocks[sym] = {'shares': pos['shares'], 'cost_basis': pos['cost_total'] / pos['shares'] if pos['shares'] > 0 else 0, 'current_value': 0, 'total_gl': 0}
-        
-        return stocks, {}, 0.0
-
-
-class RobinhoodParser(BrokerageParser):
-    name = "Robinhood"
-    
-    def can_parse(self, headers: List[str], content: str) -> bool:
-        hl = ','.join(h.lower() for h in headers)
-        return ('activity date' in hl or 'trans code' in hl) and ('instrument' in hl or 'symbol' in hl)
-    
-    def parse(self, filepath: str) -> Tuple[Dict, Dict, float]:
-        stocks, positions = {}, {}
-        
-        with open(filepath, 'r', encoding='utf-8-sig') as f:
-            lines = f.readlines()
-        
-        header_idx = next((i for i, l in enumerate(lines) if any(h in l.lower() for h in ['activity date', 'trans code', 'instrument'])), 0)
-        headers = [h.strip().lower() for h in lines[header_idx].split(',')]
-        
-        def find_col(*names):
-            for n in names:
-                if n in headers:
-                    return headers.index(n)
-            return -1
-        
-        action_col = find_col('trans code', 'type', 'description')
-        symbol_col = find_col('instrument', 'symbol')
-        qty_col = find_col('quantity', 'qty')
-        price_col = find_col('price', 'amount')
-        
-        for line in lines[header_idx + 1:]:
-            fields = self.parse_csv_line(line)
-            if len(fields) <= max(symbol_col, qty_col, 0):
-                continue
-            
-            action = fields[action_col].upper() if 0 <= action_col < len(fields) else ''
-            symbol = fields[symbol_col].strip().upper() if 0 <= symbol_col < len(fields) else ''
-            qty = abs(self.clean_number(fields[qty_col])) if 0 <= qty_col < len(fields) else 0
-            price = abs(self.clean_number(fields[price_col])) if 0 <= price_col < len(fields) else 0
-            
-            if not symbol or qty == 0:
-                continue
-            
-            if symbol not in positions:
-                positions[symbol] = {'shares': 0, 'cost_total': 0}
-            
-            if 'BUY' in action:
-                positions[symbol]['shares'] += qty
-                positions[symbol]['cost_total'] += qty * price
-            elif 'SELL' in action:
-                positions[symbol]['shares'] -= qty
-        
-        for sym, pos in positions.items():
-            if pos['shares'] > 0.001:
-                stocks[sym] = {'shares': pos['shares'], 'cost_basis': pos['cost_total'] / pos['shares'] if pos['shares'] > 0 else 0, 'current_value': 0, 'total_gl': 0}
-        
-        return stocks, {}, 0.0
-
-
-class ThinkorswimParser(BrokerageParser):
-    name = "thinkorswim"
-    
-    def can_parse(self, headers: List[str], content: str) -> bool:
-        hl = ','.join(h.lower() for h in headers)
-        return ('exec time' in hl or 'side' in hl) and ('symbol' in hl or 'underlying' in hl)
-    
-    def parse(self, filepath: str) -> Tuple[Dict, Dict, float]:
-        stocks, positions = {}, {}
-        
-        with open(filepath, 'r', encoding='utf-8-sig') as f:
-            lines = f.read().split('\n')
-        
-        header_idx = next((i for i, l in enumerate(lines) if ('symbol' in l.lower() and ('side' in l.lower() or 'type' in l.lower())) or 'exec time' in l.lower()), 0)
-        headers = [h.strip().lower() for h in lines[header_idx].split(',')]
-        
-        def find_col(*names):
-            for n in names:
-                for i, h in enumerate(headers):
-                    if n in h:
-                        return i
-            return -1
-        
-        symbol_col = find_col('symbol', 'underlying')
-        action_col = find_col('side', 'type', 'action')
-        qty_col = find_col('qty', 'quantity')
-        price_col = find_col('price', 'avg price')
-        
-        for line in lines[header_idx + 1:]:
-            if not line.strip():
-                continue
-            fields = self.parse_csv_line(line)
-            if len(fields) <= max(symbol_col, qty_col, 0):
-                continue
-            
-            symbol = fields[symbol_col].strip().upper() if symbol_col >= 0 else ''
-            action = fields[action_col].upper() if 0 <= action_col < len(fields) else ''
-            qty = abs(self.clean_number(fields[qty_col])) if qty_col >= 0 and qty_col < len(fields) else 0
-            price = abs(self.clean_number(fields[price_col])) if price_col >= 0 and price_col < len(fields) else 0
-            
-            if ' ' in symbol:
-                symbol = symbol.split()[0]
-            symbol = ''.join(c for c in symbol if c.isalpha())[:5]
-            
-            if not symbol or qty == 0:
-                continue
-            
-            if symbol not in positions:
-                positions[symbol] = {'shares': 0, 'cost_total': 0}
-            
-            if any(b in action for b in ['BUY', 'BTO', 'BOT']):
-                positions[symbol]['shares'] += qty
-                positions[symbol]['cost_total'] += qty * price
-            elif any(s in action for s in ['SELL', 'STC', 'SLD']):
-                positions[symbol]['shares'] -= qty
-        
-        for sym, pos in positions.items():
-            if pos['shares'] > 0.001:
-                stocks[sym] = {'shares': pos['shares'], 'cost_basis': pos['cost_total'] / pos['shares'] if pos['shares'] > 0 else 0, 'current_value': 0, 'total_gl': 0}
-        
-        return stocks, {}, 0.0
-
-
-class GenericParser(BrokerageParser):
-    name = "Generic CSV"
-    
-    def can_parse(self, headers: List[str], content: str) -> bool:
-        return True
-    
-    def parse(self, filepath: str) -> Tuple[Dict, Dict, float]:
-        stocks = {}
-        
-        try:
-            df = pd.read_csv(filepath, encoding='utf-8-sig')
-        except:
-            df = pd.read_csv(filepath, encoding='latin-1')
-        
-        df.columns = [c.strip().lower() for c in df.columns]
-        
-        def find_col(candidates):
-            for c in candidates:
-                for col in df.columns:
-                    if c in col:
-                        return col
-            return None
-        
-        sym_col = find_col(['symbol', 'ticker', 'security', 'stock'])
-        qty_col = find_col(['quantity', 'qty', 'shares', 'units'])
-        price_col = find_col(['price', 'cost', 'avg cost', 'average cost', 'cost basis'])
-        action_col = find_col(['action', 'type', 'transaction', 'side'])
-        
-        if not sym_col or not qty_col:
-            return {}, {}, 0.0
-        
-        positions = {}
-        for _, row in df.iterrows():
-            symbol = str(row.get(sym_col, '')).strip().upper()
-            if not symbol or len(symbol) > 6:
-                continue
-            
-            qty = self.clean_number(row.get(qty_col, 0))
-            price = self.clean_number(row.get(price_col, 0)) if price_col else 0
-            action = str(row.get(action_col, 'BUY')).upper() if action_col else 'BUY'
-            
-            if qty == 0:
-                continue
-            
-            if symbol not in positions:
-                positions[symbol] = {'shares': 0, 'cost_total': 0}
-            
-            if 'SELL' in action or 'SLD' in action:
-                positions[symbol]['shares'] -= abs(qty)
-            else:
-                positions[symbol]['shares'] += abs(qty)
-                positions[symbol]['cost_total'] += abs(qty) * price
-        
-        for sym, pos in positions.items():
-            if pos['shares'] > 0.001:
-                stocks[sym] = {'shares': pos['shares'], 'cost_basis': pos['cost_total'] / pos['shares'] if pos['shares'] > 0 else 0, 'current_value': 0, 'total_gl': 0}
-        
-        return stocks, {}, 0.0
-
-
-# =============================================================================
-# CSV IMPORT MANAGER
-# =============================================================================
-
-class CSVImportManager:
+class PriceFetcher:
     def __init__(self):
-        self.parsers = [FidelityParser(), SchwabParser(), ETRADEParser(), RobinhoodParser(), ThinkorswimParser(), GenericParser()]
-    
-    def detect_and_parse(self, filepath: str) -> Tuple[str, Dict, Dict, float]:
-        filepath = os.path.expanduser(filepath)
-        filepath = os.path.abspath(filepath)
-        
-        if not os.path.exists(filepath):
-            raise FileNotFoundError(f"File not found: {filepath}")
-        
-        with open(filepath, 'r', encoding='utf-8-sig') as f:
-            content = f.read()
-        
-        headers = []
-        for line in content.split('\n')[:10]:
-            if ',' in line and any(c.isalpha() for c in line):
-                headers = [h.strip() for h in line.split(',')]
-                break
-        
-        for parser in self.parsers:
-            if parser.can_parse(headers, content):
-                print(Fore.CYAN + f"Detected format: {parser.name}")
-                stocks, options, cash = parser.parse(filepath)
-                return parser.name, stocks, options, cash
-        
-        raise ValueError("Could not detect CSV format")
-    
-    def parse_with_format(self, filepath: str, format_name: str) -> Tuple[Dict, Dict, float]:
-        filepath = os.path.expanduser(filepath)
-        parser_map = {p.name.lower(): p for p in self.parsers}
-        parser = parser_map.get(format_name.lower())
-        
-        if not parser:
-            raise ValueError(f"Unknown format: {format_name}")
-        
-        return parser.parse(filepath)
-
-
-# =============================================================================
-# DATA FETCHER
-# =============================================================================
-
-class DataFetcher:
-    def __init__(self):
-        self.cache: Dict[str, Tuple[float, Any, pd.DataFrame]] = {}
-        self.source = None
-        self.session = requests.Session()
-        self.session.headers.update({'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36'})
-
-    def get_price(self, symbol: str) -> Optional[float]:
+        self.stock_cache = {}
+        self.option_cache = {}
+        self.history_cache = {}
+        self.cache_ttl = 60
+        self.history_ttl = 1800
+    def get_stock_price(self, symbol, verbose=False):
         symbol = symbol.upper().strip()
-        cached = price_cache.get(symbol)
-        if cached is not None:
-            return cached
-
-        price_cache.wait_for_rate_limit()
-
+        cached = self.stock_cache.get(symbol)
+        if cached and (_now() - cached['time']) < self.cache_ttl: return cached['data']
+        result = {'price': 0, 'prev': 0, 'change': 0, 'pct': 0, 'source': 'none'}
         try:
-            url = f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}"
-            r = self.session.get(url, params={"interval": "1d", "range": "1d"}, timeout=10)
-            if r.status_code == 200:
-                data = r.json()
-                result = data.get('chart', {}).get('result', [])
-                if result:
-                    price = result[0].get('meta', {}).get('regularMarketPrice')
-                    if price:
-                        price_cache.set(symbol, price)
-                        return price
-        except:
-            pass
-
+            resp = requests.get(f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}", headers={'User-Agent': 'Mozilla/5.0'}, timeout=10)
+            if resp.status_code == 200:
+                meta = resp.json().get('chart', {}).get('result', [{}])[0].get('meta', {})
+                price = meta.get('regularMarketPrice', 0)
+                prev = meta.get('previousClose', 0) or meta.get('chartPreviousClose', 0)
+                if price and float(price) > 0:
+                    result = {'price': float(price), 'prev': float(prev) if prev else float(price), 'source': 'yahoo_live', 'change': 0, 'pct': 0}
+                    result['change'] = result['price'] - result['prev']
+                    result['pct'] = (result['change'] / result['prev'] * 100) if result['prev'] else 0
+                    if verbose: print(f"      {symbol}: ${result['price']:.2f} (live)")
+        except Exception as e:
+            if verbose: print(f"      {symbol}: ERROR - {e}")
+        if result['price'] > 0: self.stock_cache[symbol] = {'time': _now(), 'data': result}
+        return result
+    def get_option_price(self, symbol, expiration, strike, opt_type, underlying_price=0):
+        cache_key = f"{symbol}_{expiration}_{strike}_{opt_type}"
+        cached = self.option_cache.get(cache_key)
+        if cached and (_now() - cached['time']) < self.cache_ttl: return cached['data']
+        result = {'price': 0, 'bid': 0, 'ask': 0, 'iv': 0.5, 'source': 'none'}
+        is_call = opt_type.lower().startswith('c')
         try:
-            import yfinance as yf
             ticker = yf.Ticker(symbol)
-            data = ticker.history(period='1d')
-            if not data.empty:
-                price = float(data['Close'].iloc[-1])
-                price_cache.set(symbol, price)
-                return price
-        except:
-            pass
-
+            if expiration in ticker.options:
+                chain = ticker.option_chain(expiration)
+                df = chain.calls if is_call else chain.puts
+                matches = df[abs(df['strike'] - strike) < 0.01]
+                if not matches.empty:
+                    row = matches.iloc[0]
+                    bid, ask, last = safe_float(row.get('bid')), safe_float(row.get('ask')), safe_float(row.get('lastPrice'))
+                    result['bid'], result['ask'] = bid, ask
+                    result['iv'] = safe_float(row.get('impliedVolatility')) or 0.5
+                    result['price'] = (bid + ask) / 2 if bid > 0 and ask > 0 else last
+                    if result['price'] > 0: result['source'] = 'yahoo_chain'
+        except: pass
+        if result['price'] == 0 and underlying_price > 0 and HAS_SCIPY:
+            days = dte(expiration)
+            if days > 0:
+                bs_price = BlackScholes.price(underlying_price, strike, days/365.0, config.risk_free_rate, result['iv'], 'call' if is_call else 'put')
+                if bs_price > 0.01: result['price'], result['source'] = bs_price, 'black_scholes'
+        if result['price'] > 0: self.option_cache[cache_key] = {'time': _now(), 'data': result}
+        return result
+    def get_history(self, symbol, period="6mo"):
+        key = f"{symbol}_{period}"
+        cached = self.history_cache.get(key)
+        if cached and (_now() - cached['time']) < self.history_ttl: return cached['data']
+        try:
+            df = yf.Ticker(symbol).history(period=period)
+            if df is not None and not df.empty:
+                self.history_cache[key] = {'time': _now(), 'data': df}
+                return df
+        except: pass
         return None
+    def clear_cache(self):
+        self.stock_cache.clear()
+        self.option_cache.clear()
+        self.history_cache.clear()
 
-    def get_prices_batch(self, symbols: List[str]) -> Dict[str, float]:
-        results = {}
-        symbols = [s.upper().strip() for s in symbols if s]
-        to_fetch = []
-        
-        for sym in symbols:
-            cached = price_cache.get(sym)
-            if cached is not None:
-                results[sym] = cached
-            else:
-                to_fetch.append(sym)
-        
-        if not to_fetch:
-            return results
-        
-        with ThreadPoolExecutor(max_workers=config.max_concurrent_requests) as executor:
-            futures = {executor.submit(self.get_price, sym): sym for sym in to_fetch}
-            for future in as_completed(futures):
-                sym = futures[future]
-                try:
-                    price = future.result()
-                    if price:
-                        results[sym] = price
-                except:
-                    pass
-        
-        return results
-
-    def fetch(self, symbol: str, quick: bool = False) -> Tuple[Optional[Dict], Optional[pd.DataFrame]]:
-        symbol = symbol.upper().strip()
-        
-        if quick and symbol in self.cache:
-            t, info, hist = self.cache[symbol]
-            if time.time() - t < 300:
-                return info, hist
-
-        price_cache.wait_for_rate_limit()
-
-        try:
-            import yfinance as yf
-            ticker = yf.Ticker(symbol)
-            info = ticker.info
-            hist = ticker.history(period="1y")
-            if not hist.empty:
-                self.source = "yfinance"
-                self.cache[symbol] = (time.time(), info, hist)
-                if 'regularMarketPrice' in info:
-                    price_cache.set(symbol, info['regularMarketPrice'])
-                return info, hist
-        except:
-            pass
-
-        try:
-            url = f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}"
-            r = self.session.get(url, params={"interval": "1d", "range": "1y"}, timeout=15)
-            if r.status_code == 200:
-                data = r.json()
-                result = data.get('chart', {}).get('result', [])
-                if result:
-                    result = result[0]
-                    meta = result.get('meta', {})
-                    ts = result.get('timestamp', [])
-                    q = result.get('indicators', {}).get('quote', [{}])[0]
-                    if ts and q:
-                        df = pd.DataFrame({'Open': q.get('open'), 'High': q.get('high'), 'Low': q.get('low'), 'Close': q.get('close'), 'Volume': q.get('volume')}, index=pd.to_datetime(ts, unit='s')).dropna()
-                        info = {'regularMarketPrice': meta.get('regularMarketPrice'), 'previousClose': meta.get('previousClose'), 'longName': meta.get('longName', symbol)}
-                        self.source = "Direct API"
-                        self.cache[symbol] = (time.time(), info, df)
-                        return info, df
-        except:
-            pass
-
-        return None, None
-
-
-# =============================================================================
-# PORTFOLIO MANAGER
-# =============================================================================
+class FidelityParser:
+    def parse(self, filepath):
+        fp = Path(os.path.expanduser(filepath)).resolve()
+        if not fp.exists(): raise FileNotFoundError(f"File not found: {fp}")
+        df = None
+        # CRITICAL FIX: Use utf-8-sig to handle BOM and index_col=False to prevent column shift
+        for enc in ['utf-8-sig', 'utf-8', 'latin1', 'cp1252']:
+            try: 
+                df = pd.read_csv(fp, encoding=enc, index_col=False)
+                break
+            except: continue
+        if df is None: raise ValueError(f"Could not read: {fp}")
+        df.columns = [str(c).strip() for c in df.columns]
+        print(f"  Found {len(df)} rows, {len(df.columns)} columns")
+        col_map = {}
+        for col in df.columns:
+            cl = col.lower().strip()
+            if cl == 'symbol': col_map['symbol'] = col
+            elif cl == 'description': col_map['desc'] = col
+            elif cl == 'quantity': col_map['qty'] = col
+            elif cl == 'last price': col_map['price'] = col
+            elif cl == 'current value': col_map['value'] = col
+            elif cl == 'cost basis total': col_map['cost'] = col
+            elif cl == 'average cost basis': col_map['avg'] = col
+            elif cl == 'total gain/loss dollar': col_map['pnl'] = col
+            elif cl == "today's gain/loss dollar": col_map['day_pnl'] = col
+        print(f"\n  Column mapping:")
+        for k, v in col_map.items(): print(f"    {k}: {v}")
+        stocks, options, skipped, cash = {}, [], [], 0
+        print(f"\n  Parsing positions...")
+        for idx, row in df.iterrows():
+            raw_sym = str(row.get(col_map.get('symbol', ''), '')).strip()
+            desc = str(row.get(col_map.get('desc', ''), '')).strip().upper()
+            if not raw_sym or raw_sym.upper() in ('', 'NAN', 'SYMBOL') or 'PENDING' in raw_sym.upper(): continue
+            if 'SPAXX' in raw_sym.upper() or 'MONEY MARKET' in desc:
+                cash_val = safe_float(row.get(col_map.get('value', ''), 0))
+                if cash_val > 0: cash = cash_val; print(f"    [CASH] ${cash:,.2f}")
+                continue
+            qty = safe_float(row.get(col_map.get('qty', ''), 0))
+            if abs(qty) < 0.0001: continue
+            last_price = safe_float(row.get(col_map.get('price', ''), 0))
+            current_value = safe_float(row.get(col_map.get('value', ''), 0))
+            cost_basis = safe_float(row.get(col_map.get('cost', ''), 0))
+            avg_cost = safe_float(row.get(col_map.get('avg', ''), 0))
+            fidelity_pnl = safe_float(row.get(col_map.get('pnl', ''), 0))
+            day_pnl = safe_float(row.get(col_map.get('day_pnl', ''), 0))
+            opt = self._parse_option(raw_sym, qty, cost_basis, last_price, current_value, fidelity_pnl, day_pnl)
+            if opt:
+                options.append(opt)
+                print(f"    [OPT] {opt['symbol']:5} {opt['type'][0].upper()} ${opt['strike']:<8.2f} {opt['expiration']} qty:{opt['qty']:>3} cost:{fmt_money(opt['cost']):>10}")
+                continue
+            ticker = self._get_ticker(raw_sym, desc)
+            if ticker:
+                if ticker in stocks:
+                    stocks[ticker]['qty'] += qty
+                    stocks[ticker]['cost'] += abs(cost_basis)
+                    stocks[ticker]['fidelity_value'] += abs(current_value)
+                    stocks[ticker]['fidelity_pnl'] += fidelity_pnl
+                else:
+                    stocks[ticker] = {'qty': qty, 'cost': abs(cost_basis), 'avg': avg_cost or (abs(cost_basis)/qty if qty else 0), 'fidelity_price': last_price, 'fidelity_value': abs(current_value), 'fidelity_pnl': fidelity_pnl, 'day_pnl': day_pnl}
+                print(f"    [STK] {ticker:5} qty:{qty:>10.4f} cost:{fmt_money(abs(cost_basis)):>10}")
+            else: skipped.append(raw_sym[:30])
+        print(f"\n  Parsed: {len(stocks)} stocks, {len(options)} options")
+        if skipped: print(f"  Skipped: {', '.join(skipped[:5])}")
+        return stocks, options, cash
+    def _get_ticker(self, raw_sym, desc=""):
+        raw = raw_sym.strip().upper()
+        if raw.startswith('-'): raw = raw[1:]
+        if re.match(r'^[A-Z]+\d{6}[CP][\d\.]+$', raw): return None
+        if len(raw) <= 5 and raw.isalpha(): return raw
+        for company, ticker in COMPANY_TO_TICKER.items():
+            if company in raw or company in desc: return ticker
+        return None
+    def _parse_option(self, raw_sym, qty, cost_basis, last_price, current_value, fidelity_pnl, day_pnl=0):
+        sym = raw_sym.strip().upper()
+        is_short = sym.startswith('-')
+        if is_short: sym = sym[1:].strip()
+        m = re.match(r'^([A-Z]+)(\d{6})([CP])([\d\.]+)$', sym)
+        if not m: return None
+        root, date_str, opt_type_char, strike_str = m.groups()
+        exp = f"20{date_str[0:2]}-{date_str[2:4]}-{date_str[4:6]}"
+        # FIX: Fidelity reports contracts as whole numbers - no multiplication needed
+        contracts = int(round(abs(qty)))
+        if is_short or qty < 0: contracts = -abs(contracts)
+        return {'symbol': root, 'type': 'call' if opt_type_char == 'C' else 'put', 'strike': float(strike_str), 'expiration': exp, 'qty': contracts, 'cost': abs(cost_basis), 'fidelity_price': last_price, 'fidelity_value': abs(current_value), 'fidelity_pnl': fidelity_pnl, 'day_pnl': day_pnl}
 
 class Portfolio:
     def __init__(self):
-        self.stocks = self._load('portfolio.json')
-        self.options = self._load('options_portfolio.json')
-        self.cash = self._load_value('cash.json', 'amount', 0.0)
-        self.csv_manager = CSVImportManager()
-
-    def _load(self, filename: str) -> Dict:
-        path = config.get_path(filename)
-        try:
-            if os.path.exists(path):
-                with open(path, 'r') as f:
-                    return json.load(f)
-        except:
-            pass
-        return {}
-
-    def _save(self, filename: str, data: Dict):
-        with open(config.get_path(filename), 'w') as f:
-            json.dump(data, f, indent=2)
-
-    def _load_value(self, filename: str, key: str, default: Any) -> Any:
-        return self._load(filename).get(key, default)
-
-    def _save_stocks(self):
-        self._save('portfolio.json', self.stocks)
-
-    def _save_options(self):
-        self._save('options_portfolio.json', self.options)
-
-    def _save_cash(self):
-        self._save('cash.json', {'amount': self.cash})
-
-    def set_cash(self, amount: float):
-        self.cash = float(amount)
-        self._save_cash()
-        print(Fore.GREEN + f"Cash balance set to ${self.cash:,.2f}")
-
-    def add_stock(self, symbol: str, shares: float, cost: float):
-        symbol = symbol.upper()
-        self.stocks[symbol] = {'shares': shares, 'cost_basis': cost, 'current_value': 0, 'total_gl': 0}
-        self._save_stocks()
-        print(Fore.GREEN + f"Added {symbol}: {shares} shares @ ${cost:.2f}")
-
-    def remove_stock(self, symbol: str):
-        symbol = symbol.upper()
-        if symbol in self.stocks:
-            del self.stocks[symbol]
-            self._save_stocks()
-            print(Fore.YELLOW + f"Removed {symbol}")
-        else:
-            print(Fore.RED + f"Stock not found: {symbol}")
-
-    def add_option(self, symbol: str, otype: str, strike: float, expiry: str, contracts: int, premium: float, pos_type: str = 'long'):
-        symbol = symbol.upper()
-        oid = f"{symbol}_{expiry}_{otype[0].upper()}{int(strike)}"
-        self.options[oid] = {'symbol': symbol, 'type': otype.lower(), 'strike': strike, 'expiration': expiry, 'contracts': contracts, 'premium': premium, 'position_type': pos_type, 'total_cost': contracts * 100 * premium, 'current_value': 0, 'total_gl': 0}
-        self._save_options()
-        print(Fore.GREEN + f"{'Bought' if pos_type == 'long' else 'Sold'} {contracts} {symbol} ${strike} {otype}s expiring {expiry}")
-
-    def remove_option(self, oid: str):
-        if oid in self.options:
-            del self.options[oid]
-            self._save_options()
-            print(Fore.YELLOW + f"Removed option: {oid}")
-        else:
-            print(Fore.RED + f"Option not found: {oid}")
-            if self.options:
-                print("Available: " + ", ".join(list(self.options.keys())[:5]))
-
-    def clear(self, stocks: bool = True, options: bool = True):
-        if stocks:
-            self.stocks = {}
-            self._save_stocks()
-            print(Fore.YELLOW + "Stock positions cleared")
-        if options:
-            self.options = {}
-            self._save_options()
-            print(Fore.YELLOW + "Options positions cleared")
-
-    def import_csv(self, filepath: str, format_name: str = None):
-        filepath = os.path.expanduser(filepath.strip().strip('"').strip("'"))
-        print(Fore.CYAN + f"\nImporting from: {filepath}")
-        
-        if not os.path.exists(filepath):
-            print(Fore.RED + f"File not found: {filepath}")
-            downloads = os.path.expanduser("~/Downloads")
-            if os.path.exists(downloads):
-                csvs = [f for f in os.listdir(downloads) if f.endswith('.csv')]
-                if csvs:
-                    print(Fore.YELLOW + "CSV files in Downloads: " + ", ".join(csvs[:5]))
-            return 0, 0
-        
-        try:
-            if format_name:
-                brokerage = format_name
-                stocks, options, cash = self.csv_manager.parse_with_format(filepath, format_name)
-            else:
-                brokerage, stocks, options, cash = self.csv_manager.detect_and_parse(filepath)
-            
-            for sym, data in stocks.items():
-                self.stocks[sym] = data
-                print(Fore.GREEN + f"  Stock: {sym} | {data['shares']:.2f} @ ${data['cost_basis']:.2f}")
-            
-            for oid, data in options.items():
-                self.options[oid] = data
-                print(Fore.GREEN + f"  Option: {oid}")
-            
-            if cash > 0:
-                self.cash = cash
-                self._save_cash()
-            
-            self._save_stocks()
-            self._save_options()
-            
-            print(Fore.GREEN + f"\n✓ Import complete from {brokerage}! Stocks: {len(stocks)}, Options: {len(options)}")
-            return len(stocks), len(options)
-        except Exception as e:
-            print(Fore.RED + f"Import error: {e}")
-            return 0, 0
-
-    def export_csv(self, filepath: str):
-        filepath = os.path.expanduser(filepath.strip().strip('"').strip("'"))
-        rows = []
-        for sym, pos in self.stocks.items():
-            rows.append({'Type': 'Stock', 'Symbol': sym, 'Quantity': pos['shares'], 'Cost Basis': pos['cost_basis'], 'Value': pos.get('current_value', 0), 'P&L': pos.get('total_gl', 0)})
-        for oid, opt in self.options.items():
-            rows.append({'Type': 'Option', 'Symbol': f"{opt['symbol']} ${opt['strike']}{opt['type'][0].upper()}", 'Quantity': opt['contracts'], 'Cost Basis': opt['premium'], 'Value': opt.get('current_value', 0), 'P&L': opt.get('total_gl', 0), 'Expiration': opt['expiration']})
-        
-        df = pd.DataFrame(rows)
-        df.to_csv(filepath, index=False)
-        print(Fore.GREEN + f"Exported portfolio to {filepath}")
-
-    def display(self, fetcher: DataFetcher):
-        if not self.stocks and not self.options:
-            print(Fore.YELLOW + "\nPortfolio empty. Use: buy SYMBOL SHARES PRICE  or  import /path/to/file.csv")
-            return
-
-        print(Fore.CYAN + "\n" + "=" * 70 + "\n  PORTFOLIO SUMMARY\n" + "=" * 70 + Style.RESET_ALL)
-
-        all_symbols = set(self.stocks.keys()) | {o['symbol'] for o in self.options.values()}
-        print(f"\nFetching prices for {len(all_symbols)} symbols...")
-        prices = fetcher.get_prices_batch(list(all_symbols))
-        for sym, price in sorted(prices.items()):
-            print(f"  {sym}: ${price:.2f}")
-
-        total_stock_cost = total_stock_value = total_stock_pnl = 0
-        total_opts_cost = total_opts_value = total_opts_pnl = 0
-
-        if self.stocks:
-            print(Fore.CYAN + f"\nSTOCKS ({len(self.stocks)})" + Style.RESET_ALL + "\n" + "-" * 70)
-            data = []
-            for sym, pos in sorted(self.stocks.items()):
-                shares, cost_basis = pos['shares'], pos['cost_basis']
-                cost_total = shares * cost_basis
-                current_price = prices.get(sym, 0)
-                current_value = shares * current_price if current_price else pos.get('current_value', 0)
-                pnl = current_value - cost_total if current_value else pos.get('total_gl', 0)
-                total_stock_cost += cost_total
-                total_stock_value += current_value
-                total_stock_pnl += pnl
-                pnl_color = Fore.GREEN if pnl >= 0 else Fore.RED
-                data.append([sym[:12], f"{shares:.2f}", f"${cost_total:,.2f}", f"${current_value:,.2f}", f"{pnl_color}${pnl:+,.2f}{Style.RESET_ALL}"])
-            print(tabulate(data, headers=["Symbol", "Qty", "Cost", "Value", "P&L"]))
-            color = Fore.GREEN if total_stock_pnl >= 0 else Fore.RED
-            print(f"\n  Stock Cost: ${total_stock_cost:,.2f} | Value: ${total_stock_value:,.2f} | P&L: {color}${total_stock_pnl:+,.2f}{Style.RESET_ALL}")
-
-        if self.options:
-            long_c = sum(1 for o in self.options.values() if o['position_type'] == 'long')
-            print(Fore.CYAN + f"\nOPTIONS ({len(self.options)}: {long_c} long, {len(self.options)-long_c} short)" + Style.RESET_ALL + "\n" + "-" * 100)
-            data = []
-            for oid, opt in sorted(self.options.items(), key=lambda x: x[1]['expiration']):
-                stock_price = prices.get(opt['symbol'], 0)
-                cost = opt.get('total_cost', 0)
-                value = opt.get('current_value', 0)
-                pnl = opt.get('total_gl', 0) if opt.get('total_gl', 0) != 0 else (value - cost)
-                try:
-                    dte = (datetime.strptime(opt['expiration'], '%Y-%m-%d') - datetime.now()).days
-                except:
-                    dte = 0
-                dte_str = Fore.RED + "EXP" + Style.RESET_ALL if dte < 0 else (Fore.YELLOW + f"{dte}d" + Style.RESET_ALL if dte <= 7 else f"{dte}d")
-                itm_str = "—"
-                if stock_price > 0:
-                    is_itm = (stock_price > opt['strike']) if opt['type'] == 'call' else (stock_price < opt['strike'])
-                    itm_str = Fore.GREEN + "ITM" + Style.RESET_ALL if is_itm else "OTM"
-                total_opts_cost += cost
-                total_opts_value += abs(value)
-                total_opts_pnl += pnl
-                pos_str = Fore.GREEN + "LONG" + Style.RESET_ALL if opt['position_type'] == 'long' else Fore.MAGENTA + "SHORT" + Style.RESET_ALL
-                pnl_color = Fore.GREEN if pnl >= 0 else Fore.RED
-                opt_type = opt.get('type', 'call')
-                data.append([f"{opt['symbol']} ${opt['strike']:.0f}{opt_type[0].upper()}", opt['expiration'], dte_str, opt['contracts'], pos_str, f"${cost:,.2f}", f"${abs(value):,.2f}", itm_str, f"{pnl_color}${pnl:+,.2f}{Style.RESET_ALL}"])
-            print(tabulate(data, headers=["Option", "Expiry", "DTE", "Qty", "Type", "Cost", "Value", "ITM", "P&L"]))
-            color = Fore.GREEN if total_opts_pnl >= 0 else Fore.RED
-            print(f"\n  Options Cost: ${total_opts_cost:,.2f} | Value: ${total_opts_value:,.2f} | P&L: {color}${total_opts_pnl:+,.2f}{Style.RESET_ALL}")
-
-        print(Fore.CYAN + "\n" + "=" * 70 + "\nPORTFOLIO TOTAL" + Style.RESET_ALL)
-        grand_cost = total_stock_cost + total_opts_cost
-        grand_value = total_stock_value + total_opts_value + self.cash
-        grand_pnl = total_stock_pnl + total_opts_pnl
-        color = Fore.GREEN if grand_pnl >= 0 else Fore.RED
-        print(f"  Total Cost: ${grand_cost:,.2f} | Total Value: ${grand_value:,.2f}" + (f" | Cash: ${self.cash:,.2f}" if self.cash > 0 else "") + f" | P&L: {color}${grand_pnl:+,.2f}{Style.RESET_ALL}")
-
-
-# =============================================================================
-# WATCHLIST MANAGER
-# =============================================================================
-
-class WatchlistManager:
-    def __init__(self):
-        self.filename = config.get_path('watchlist.json')
+        self.file = Path(config.data_dir) / "portfolio.json"
         self.data = self._load()
-
-    def _load(self) -> Dict:
+    def _load(self):
+        if self.file.exists():
+            try: return json.loads(self.file.read_text())
+            except: pass
+        return {'stocks': {}, 'options': [], 'cash': 0}
+    def _save(self): self.file.write_text(json.dumps(self.data, indent=2))
+    def clear(self): self.data = {'stocks': {}, 'options': [], 'cash': 0}; self._save(); success("Portfolio cleared")
+    def import_csv(self, filepath):
+        print(Fore.CYAN + f"\n{'═'*60}\n IMPORTING FIDELITY CSV\n{'═'*60}" + Style.RESET_ALL)
         try:
-            if os.path.exists(self.filename):
-                with open(self.filename, 'r') as f:
-                    return json.load(f)
-        except:
-            pass
-        return {}
-
-    def _save(self):
-        with open(self.filename, 'w') as f:
-            json.dump(self.data, f, indent=2)
-
-    def add(self, symbol: str, high: float = None, low: float = None):
-        self.data[symbol.upper()] = {'high': high, 'low': low}
-        self._save()
-        print(Fore.GREEN + f"Added {symbol.upper()} to watchlist")
-
-    def remove(self, symbol: str):
-        symbol = symbol.upper()
-        if symbol in self.data:
-            del self.data[symbol]
+            stocks, options, cash = FidelityParser().parse(filepath)
+            self.data = {'stocks': stocks, 'options': options, 'cash': cash, 'imported': datetime.now().isoformat()}
             self._save()
-            print(Fore.YELLOW + f"Removed {symbol}")
-        else:
-            print(Fore.RED + f"{symbol} not in watchlist")
+            print(f"\n{Fore.GREEN}✓ Imported {len(stocks)} stocks, {len(options)} options, ${cash:,.2f} cash{Style.RESET_ALL}")
+        except Exception as e: err(str(e))
+    def display(self, fetcher):
+        stocks, options, cash = self.data.get('stocks', {}), self.data.get('options', []), self.data.get('cash', 0)
+        if not stocks and not options: warn("No positions. Use 'import FILE' first."); return
+        print(Fore.CYAN + f"\n{'═'*80}\n PORTFOLIO — {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} (LIVE)\n{'═'*80}" + Style.RESET_ALL)
+        total_value, total_cost, total_pnl, total_day_pnl = 0, 0, 0, 0
+        all_symbols = set(stocks.keys()) | set(o['symbol'] for o in options)
+        print(f"\n  Fetching live prices for {len(all_symbols)} symbols...")
+        stock_prices = {}
+        prog = ProgressBar(len(all_symbols), "  ")
+        for i, sym in enumerate(all_symbols): prog.update(i, sym); stock_prices[sym] = fetcher.get_stock_price(sym)
+        prog.done()
+        if stocks:
+            print(f"\n{Style.BRIGHT}STOCKS ({len(stocks)}){Style.RESET_ALL}\n" + "─"*80)
+            rows = []
+            for sym, pos in sorted(stocks.items()):
+                live = stock_prices.get(sym, {})
+                price, day_pct = live.get('price', 0), live.get('pct', 0)
+                qty, cost, avg = pos['qty'], pos['cost'], pos.get('avg', pos['cost']/pos['qty'] if pos['qty'] else 0)
+                if price > 0:
+                    value = qty * price
+                    pnl = value - cost
+                    price_str = fmt_money(price)
+                    day_str = color_pct(day_pct)
+                else:
+                    value = pos.get('fidelity_value', 0)
+                    pnl = pos.get('fidelity_pnl', 0)
+                    price_str = f"~{fmt_money(pos.get('fidelity_price', 0))}"
+                    day_str = "-"
+                pnl_pct = (pnl / cost * 100) if cost else 0
+                total_value += value; total_cost += cost; total_pnl += pnl
+                total_day_pnl += pos.get('day_pnl', 0)
+                rows.append([sym, f"{qty:.4f}" if abs(qty) < 10 else f"{qty:.2f}", fmt_money(avg), price_str, day_str, fmt_money(value), color_pnl(pnl, pnl_pct)])
+            print(tabulate(rows, headers=["Symbol", "Qty", "Avg", "Price", "Day%", "Value", "P&L"]))
+        if options:
+            print(f"\n{Style.BRIGHT}OPTIONS ({len(options)}){Style.RESET_ALL}\n" + "─"*80)
+            prog = ProgressBar(len(options), "  ")
+            rows = []
+            for i, o in enumerate(sorted(options, key=lambda x: (x['symbol'], x['expiration'], x['strike']))):
+                prog.update(i, o['symbol'])
+                underlying_price = stock_prices.get(o['symbol'], {}).get('price', 0)
+                opt_data = fetcher.get_option_price(o['symbol'], o['expiration'], o['strike'], o['type'], underlying_price)
+                price, source = opt_data['price'], opt_data['source']
+                days = dte(o['expiration'])
+                qty = o['qty']
+                cost = o['cost']
+                if price > 0 and source in ('yahoo_chain', 'black_scholes'):
+                    value = abs(qty) * price * 100
+                    pnl = value - cost if qty > 0 else cost - value
+                    price_str = f"${price:.2f}" if source == 'yahoo_chain' else f"~${price:.2f}"
+                else:
+                    value = abs(o.get('fidelity_value', 0))
+                    pnl = o.get('fidelity_pnl', 0)
+                    price_str = f"~${o.get('fidelity_price', 0):.2f}"
+                pnl_pct = (pnl / cost * 100) if cost else 0
+                total_value += value; total_cost += cost; total_pnl += pnl
+                total_day_pnl += o.get('day_pnl', 0)
+                desc = f"{o['symbol']} {o['expiration'][5:]} ${o['strike']:.0f}{'C' if o['type']=='call' else 'P'}"
+                ls = "S" if qty < 0 else "L"
+                rows.append([desc, ls, abs(qty), price_str, f"{days}d", fmt_money(value), color_pnl(pnl, pnl_pct)])
+            prog.done()
+            print(tabulate(rows, headers=["Option", "L/S", "Qty", "Price", "DTE", "Value", "P&L"]))
+        print(f"\n{'═'*80}")
+        print(f"  {Style.BRIGHT}TOTAL VALUE:{Style.RESET_ALL}  {fmt_money(total_value)}")
+        print(f"  {Style.BRIGHT}TOTAL COST:{Style.RESET_ALL}   {fmt_money(total_cost)}")
+        print(f"  {Style.BRIGHT}TOTAL P&L:{Style.RESET_ALL}    {color_pnl(total_pnl, (total_pnl/total_cost*100) if total_cost else 0)}")
+        if total_day_pnl != 0: print(f"  {Style.BRIGHT}TODAY'S P&L:{Style.RESET_ALL}  {color_money(total_day_pnl)}")
+        if cash: print(f"  {Style.BRIGHT}CASH:{Style.RESET_ALL}         {fmt_money(cash)}")
+        if cash: print(f"  {Style.BRIGHT}TOTAL ACCT:{Style.RESET_ALL}  {fmt_money(total_value + cash)}")
+        print(f"{'═'*80}\n")
+    def analyze_symbol(self, symbol, fetcher):
+        symbol = symbol.upper()
+        print(Fore.CYAN + f"\n{'═'*60}\n TECHNICAL ANALYSIS: {symbol}\n{'═'*60}" + Style.RESET_ALL)
+        df = fetcher.get_history(symbol, "6mo")
+        if df is None or df.empty: err(f"Could not fetch data for {symbol}"); return
+        analysis = TechnicalAnalysis.analyze(df, symbol)
+        if 'error' in analysis: err(analysis['error']); return
+        live = fetcher.get_stock_price(symbol)
+        print(f"\n  {Style.BRIGHT}Price:{Style.RESET_ALL} {fmt_money(live.get('price', analysis['price']))} ({color_pct(live.get('pct', 0))} today)")
+        print(f"\n  {Style.BRIGHT}Indicators:{Style.RESET_ALL}")
+        for name, val in analysis['indicators'].items(): print(f"    {name:12}: {val:.2f}")
+        print(f"\n  {Style.BRIGHT}Signals:{Style.RESET_ALL}")
+        for name, signal in analysis['signals'].items(): print(f"    {name:12}: {color_signal(signal)}")
+        score = analysis['score']
+        print(f"\n  {Style.BRIGHT}Score:{Style.RESET_ALL} {Fore.GREEN if score > 0 else Fore.RED if score < 0 else Fore.YELLOW}{score:+d}{Style.RESET_ALL}")
+        for lvl, val in TechnicalAnalysis.pivot_points(df).items(): print(f"    {lvl}: {fmt_money(val)}")
+        if HAS_MATPLOTLIB and config.show_charts: self._plot_chart(df, symbol)
+    def _plot_chart(self, df, symbol):
+        try:
+            fig, axes = plt.subplots(3, 1, figsize=(12, 10), gridspec_kw={'height_ratios': [3, 1, 1]})
+            fig.suptitle(f'{symbol} Technical Analysis', fontsize=14, fontweight='bold')
+            close = df['Close']
+            upper, middle, lower = TechnicalAnalysis.bollinger_bands(close)
+            axes[0].plot(df.index, close, label='Price', color='blue')
+            axes[0].plot(df.index, upper, 'r--', alpha=0.5)
+            axes[0].plot(df.index, lower, 'r--', alpha=0.5)
+            axes[0].fill_between(df.index, lower, upper, alpha=0.1)
+            axes[0].legend(); axes[0].grid(True, alpha=0.3)
+            rsi = TechnicalAnalysis.rsi(close)
+            axes[1].plot(df.index, rsi, color='purple')
+            axes[1].axhline(70, color='red', linestyle='--', alpha=0.5)
+            axes[1].axhline(30, color='green', linestyle='--', alpha=0.5)
+            axes[1].set_ylim(0, 100); axes[1].grid(True, alpha=0.3)
+            _, _, hist = TechnicalAnalysis.macd(close)
+            axes[2].bar(df.index, hist, color=['g' if h >= 0 else 'r' for h in hist], alpha=0.5)
+            axes[2].axhline(0, color='gray'); axes[2].grid(True, alpha=0.3)
+            plt.tight_layout(); plt.show()
+        except Exception as e: warn(f"Chart error: {e}")
+    def option_greeks(self, symbol, fetcher):
+        options = [o for o in self.data.get('options', []) if o['symbol'].upper() == symbol.upper()]
+        if not options: warn(f"No options for {symbol}"); return
+        print(Fore.CYAN + f"\n{'═'*60}\n GREEKS: {symbol.upper()}\n{'═'*60}" + Style.RESET_ALL)
+        underlying = fetcher.get_stock_price(symbol).get('price', 0)
+        if underlying <= 0: err("Could not get underlying price"); return
+        print(f"\n  Underlying: {fmt_money(underlying)}")
+        rows = []
+        for o in sorted(options, key=lambda x: (x['expiration'], x['strike'])):
+            T = max(dte(o['expiration']) / 365.0, 0.001)
+            iv = fetcher.get_option_price(o['symbol'], o['expiration'], o['strike'], o['type'], underlying).get('iv', 0.5)
+            g = BlackScholes.calculate_all_greeks(underlying, o['strike'], T, config.risk_free_rate, iv, o['type'])
+            rows.append([f"{o['expiration'][5:]} ${o['strike']:.0f}{'C' if o['type']=='call' else 'P'}", o['qty'], f"{dte(o['expiration'])}d", f"{iv*100:.1f}%", f"{g['delta']:.3f}", f"{g['gamma']:.4f}", f"{g['theta']:.3f}", f"{g['vega']:.3f}"])
+        print(tabulate(rows, headers=["Option", "Qty", "DTE", "IV", "Delta", "Gamma", "Theta", "Vega"]))
+        td = sum(float(r[4])*int(r[1])*100 for r in rows)
+        print(f"\n  Portfolio Delta: {td:+.2f} (${td*underlying:,.0f} exposure)")
+    def summary(self):
+        stocks, options, cash = self.data.get('stocks', {}), self.data.get('options', []), self.data.get('cash', 0)
+        if not stocks and not options: warn("No positions. Use 'import FILE' first."); return
+        print(Fore.CYAN + f"\n{'═'*60}\n PORTFOLIO SUMMARY (from import)\n{'═'*60}" + Style.RESET_ALL)
+        total_value = sum(s.get('fidelity_value', 0) for s in stocks.values()) + sum(abs(o.get('fidelity_value', 0)) for o in options)
+        total_cost = sum(s.get('cost', 0) for s in stocks.values()) + sum(o.get('cost', 0) for o in options)
+        total_pnl = sum(s.get('fidelity_pnl', 0) for s in stocks.values()) + sum(o.get('fidelity_pnl', 0) for o in options)
+        print(f"\n  Stocks: {len(stocks)}\n  Options: {len(options)}\n  Cash: {fmt_money(cash)}")
+        print(f"\n  Total Value: {fmt_money(total_value)}\n  Total Cost: {fmt_money(total_cost)}")
+        print(f"  Total P&L: {color_pnl(total_pnl, (total_pnl/total_cost*100) if total_cost else 0)}")
+        if cash: print(f"  Total Account: {fmt_money(total_value + cash)}")
+        print()
+    def expiring_soon(self, days=7):
+        options = self.data.get('options', [])
+        if not options: warn("No options in portfolio"); return
+        expiring = [o for o in options if 0 <= dte(o['expiration']) <= days]
+        if not expiring: print(f"\n  No options expiring within {days} days"); return
+        print(Fore.CYAN + f"\n{'═'*60}\n OPTIONS EXPIRING WITHIN {days} DAYS\n{'═'*60}" + Style.RESET_ALL)
+        rows = []
+        for o in sorted(expiring, key=lambda x: (x['expiration'], x['symbol'])):
+            d = dte(o['expiration'])
+            desc = f"{o['symbol']} {o['expiration']} ${o['strike']:.0f}{'C' if o['type']=='call' else 'P'}"
+            ls = "S" if o['qty'] < 0 else "L"
+            rows.append([desc, ls, abs(o['qty']), f"{d}d", fmt_money(abs(o.get('fidelity_value', 0))), color_money(o.get('fidelity_pnl', 0))])
+        print(tabulate(rows, headers=["Option", "L/S", "Qty", "DTE", "Value", "P&L"]))
 
-    def display(self, fetcher: DataFetcher):
-        if not self.data:
-            print(Fore.YELLOW + "Watchlist empty")
-            return
-        print(Fore.CYAN + "\nWATCHLIST\n" + "-" * 50)
-        prices = fetcher.get_prices_batch(list(self.data.keys()))
-        for sym, alerts in sorted(self.data.items()):
-            price = prices.get(sym)
-            if price:
-                status = ""
-                if alerts.get('high') and price >= alerts['high']:
-                    status = Fore.RED + " ▲ HIGH ALERT" + Style.RESET_ALL
-                elif alerts.get('low') and price <= alerts['low']:
-                    status = Fore.GREEN + " ▼ LOW ALERT" + Style.RESET_ALL
-                alert_info = f" (H:{alerts.get('high', '-')} L:{alerts.get('low', '-')})" if alerts.get('high') or alerts.get('low') else ""
-                print(f"  {sym}: ${price:.2f}{alert_info}{status}")
-            else:
-                print(f"  {sym}: N/A")
+class Watchlist:
+    def __init__(self):
+        self.file = Path(config.data_dir) / "watchlist.json"
+        self.symbols = json.loads(self.file.read_text()) if self.file.exists() else []
+    def _save(self): self.file.write_text(json.dumps(self.symbols))
+    def add(self, sym): sym = sym.upper(); self.symbols.append(sym) if sym not in self.symbols else None; self._save(); success(f"Added {sym}")
+    def remove(self, sym): sym = sym.upper(); self.symbols.remove(sym) if sym in self.symbols else None; self._save(); success(f"Removed {sym}")
+    def display(self, fetcher):
+        if not self.symbols: warn("Watchlist empty"); return
+        print(Fore.CYAN + f"\n{'═'*60}\n WATCHLIST\n{'═'*60}" + Style.RESET_ALL)
+        rows = [[s, fmt_money(d['price']), color_pct(d['pct'])] if (d := fetcher.get_stock_price(s))['price'] > 0 else [s, "N/A", "-"] for s in self.symbols]
+        print(tabulate(rows, headers=["Symbol", "Price", "Change"]))
 
-
-# =============================================================================
-# TECHNICAL ANALYSIS
-# =============================================================================
-
-def calc_rsi(data: pd.DataFrame, periods: int = 14) -> pd.Series:
-    delta = data['Close'].diff()
-    gain = delta.where(delta > 0, 0).rolling(periods).mean()
-    loss = (-delta.where(delta < 0, 0)).rolling(periods).mean()
-    return 100 - (100 / (1 + gain / loss.replace(0, np.nan)))
-
-def calc_macd(data: pd.DataFrame) -> Tuple[pd.Series, pd.Series, pd.Series]:
-    exp12, exp26 = data['Close'].ewm(span=12).mean(), data['Close'].ewm(span=26).mean()
-    macd = exp12 - exp26
-    return macd, macd.ewm(span=9).mean(), macd - macd.ewm(span=9).mean()
-
-def calc_bb(data: pd.DataFrame, window: int = 20) -> Tuple[pd.Series, pd.Series, pd.Series]:
-    sma, std = data['Close'].rolling(window).mean(), data['Close'].rolling(window).std()
-    return sma + 2 * std, sma, sma - 2 * std
-
-def analyze(symbol: str, fetcher: DataFetcher):
-    symbol = symbol.upper().strip()
-    print(Fore.CYAN + f"\nAnalyzing {symbol}..." + Style.RESET_ALL)
-    info, hist = fetcher.fetch(symbol)
-    if not info or hist is None or hist.empty:
-        print(Fore.RED + "Could not fetch data. Try again in a few seconds (rate limited).")
-        return None, None
-
-    print(Fore.GREEN + f"Source: {fetcher.source}" + Style.RESET_ALL)
-    
-    # Safely get price with fallbacks
-    price = info.get('regularMarketPrice')
-    if price is None and hist is not None and not hist.empty:
-        price = float(hist['Close'].iloc[-1])
-    if price is None:
-        print(Fore.RED + "Could not get current price")
-        return None, None
-    
-    # Safely get previous close with fallback
-    prev = info.get('previousClose')
-    if prev is None and hist is not None and len(hist) > 1:
-        prev = float(hist['Close'].iloc[-2])
-    if prev is None:
-        prev = price  # Use current price if no previous available
-    
-    chg = price - prev
-    pct = (chg / prev * 100) if prev and prev != 0 else 0
-    print(f"\n  Price: ${price:.2f}")
-    print(f"  Change: {Fore.GREEN if chg >= 0 else Fore.RED}${chg:+.2f} ({pct:+.2f}%){Style.RESET_ALL}")
-
-    if len(hist) >= 20:
-        hist['RSI'] = calc_rsi(hist)
-        hist['MACD'], hist['Signal'], hist['Hist'] = calc_macd(hist)
-        hist['BB_U'], hist['BB_M'], hist['BB_L'] = calc_bb(hist)
-        hist['SMA20'], hist['SMA50'] = hist['Close'].rolling(20).mean(), hist['Close'].rolling(50).mean()
-        hist['EMA200'] = hist['Close'].ewm(span=200).mean()
-        
-        rsi = hist['RSI'].iloc[-1]
-        if pd.notna(rsi):
-            sig = "Overbought" if rsi > 70 else "Oversold" if rsi < 30 else "Neutral"
-            color = Fore.RED if rsi > 70 else Fore.GREEN if rsi < 30 else ""
-            print(f"  RSI: {color}{rsi:.1f} ({sig}){Style.RESET_ALL}")
-        if pd.notna(hist['SMA50'].iloc[-1]):
-            print(f"  SMA50: ${hist['SMA50'].iloc[-1]:.2f} (price {'above' if price > hist['SMA50'].iloc[-1] else 'below'})")
-        if pd.notna(hist['EMA200'].iloc[-1]):
-            print(f"  EMA200: ${hist['EMA200'].iloc[-1]:.2f} (price {'above' if price > hist['EMA200'].iloc[-1] else 'below'})")
-
-    if config.show_charts and len(hist) > 5:
-        create_chart(hist, symbol, info, price)
-    return hist, info
-
-def create_chart(hist: pd.DataFrame, symbol: str, info: Dict, price: float):
-    try:
-        plt.style.use('dark_background' if config.theme == 'dark' else 'default')
-        fig, axes = plt.subplots(3, 1, figsize=(14, 10), gridspec_kw={'height_ratios': [3, 1, 1]})
-        fig.suptitle(f"{info.get('longName', symbol)} ({symbol}) - ${price:.2f}", fontsize=14, fontweight='bold')
-
-        ax1 = axes[0]
-        ax1.plot(hist.index, hist['Close'], label='Price', color='white', lw=1.5)
-        for col, lbl, clr in [('SMA20', 'SMA20', '#00ff88'), ('SMA50', 'SMA50', '#ff8800'), ('EMA200', 'EMA200', '#ff00ff')]:
-            if col in hist.columns:
-                ax1.plot(hist.index, hist[col], label=lbl, alpha=0.7 if col != 'EMA200' else 1, color=clr, lw=1.5 if col != 'EMA200' else 2)
-        if 'BB_U' in hist.columns:
-            ax1.fill_between(hist.index, hist['BB_U'], hist['BB_L'], alpha=0.1, color='cyan')
-        ax1.legend(loc='upper left', fontsize=8)
-        ax1.grid(True, alpha=0.3)
-        ax1.set_ylabel('Price ($)')
-
-        ax2 = axes[1]
-        colors = ['#00ff00' if hist['Close'].iloc[i] >= hist['Open'].iloc[i] else '#ff0000' for i in range(len(hist))]
-        ax2.bar(hist.index, hist['Volume'], color=colors, alpha=0.6)
-        ax2.set_ylabel('Volume')
-        ax2.grid(True, alpha=0.3)
-
-        ax3 = axes[2]
-        if 'RSI' in hist.columns:
-            ax3.plot(hist.index, hist['RSI'], color='#aa88ff', lw=1.5)
-            ax3.axhline(70, color='#ff4444', ls='--', alpha=0.7)
-            ax3.axhline(30, color='#44ff44', ls='--', alpha=0.7)
-            ax3.axhline(50, color='gray', ls=':', alpha=0.5)
-            ax3.fill_between(hist.index, 70, 100, alpha=0.1, color='red')
-            ax3.fill_between(hist.index, 0, 30, alpha=0.1, color='green')
-            ax3.set_ylim(0, 100)
-        ax3.set_ylabel('RSI')
-        ax3.grid(True, alpha=0.3)
-
-        plt.tight_layout()
-        plt.show()
-        if config.save_charts:
-            fn = f"{symbol}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.png"
-            plt.savefig(fn, dpi=150, bbox_inches='tight')
-            print(Fore.GREEN + f"Saved: {fn}")
-    except Exception as e:
-        print(Fore.RED + f"Chart error: {e}")
-
-def compare(symbols: List[str], fetcher: DataFetcher):
-    symbols = [s.upper() for s in symbols[:8]]
-    print(Fore.CYAN + f"\nComparing: {', '.join(symbols)}" + Style.RESET_ALL)
-    data = []
-    for sym in symbols:
-        info, hist = fetcher.fetch(sym, quick=True)
-        if info:
-            price = info.get('regularMarketPrice', 0)
-            prev = info.get('previousClose', price)
-            pct = ((price - prev) / prev * 100) if prev else 0
-            rsi = calc_rsi(hist).iloc[-1] if hist is not None and len(hist) >= 14 else float('nan')
-            color = Fore.GREEN if pct >= 0 else Fore.RED
-            rsi_color = Fore.RED if pd.notna(rsi) and rsi > 70 else (Fore.GREEN if pd.notna(rsi) and rsi < 30 else "")
-            data.append([sym, f"${price:.2f}", f"{color}{pct:+.2f}%{Style.RESET_ALL}", f"{rsi_color}{rsi:.1f}{Style.RESET_ALL}" if pd.notna(rsi) else "N/A"])
-    print(tabulate(data, headers=["Symbol", "Price", "Change", "RSI"]))
-
-def scan(fetcher: DataFetcher, symbols: List[str] = None):
-    if not symbols:
-        symbols = ['AAPL', 'MSFT', 'GOOGL', 'AMZN', 'TSLA', 'NVDA', 'META', 'AMD', 'NFLX', 'SPY']
-    print(Fore.CYAN + f"\nScanning {len(symbols)} stocks..." + Style.RESET_ALL)
-    oversold, overbought, golden_cross = [], [], []
-    
-    for sym in symbols:
-        info, hist = fetcher.fetch(sym, quick=True)
-        if hist is not None and len(hist) >= 50:
-            rsi = calc_rsi(hist).iloc[-1]
-            price = info.get('regularMarketPrice', 0) if info else 0
-            sma50, ema200 = hist['Close'].rolling(50).mean().iloc[-1], hist['Close'].ewm(span=200).mean().iloc[-1]
-            if pd.notna(rsi):
-                if rsi < 30:
-                    oversold.append((sym, rsi, price))
-                elif rsi > 70:
-                    overbought.append((sym, rsi, price))
-            if pd.notna(sma50) and pd.notna(ema200) and sma50 > ema200:
-                prev_sma50, prev_ema200 = hist['Close'].rolling(50).mean().iloc[-5], hist['Close'].ewm(span=200).mean().iloc[-5]
-                if pd.notna(prev_sma50) and pd.notna(prev_ema200) and prev_sma50 <= prev_ema200:
-                    golden_cross.append((sym, price))
-
-    print("\n" + "=" * 50 + "\nSCAN RESULTS\n" + "=" * 50)
-    if oversold:
-        print(Fore.GREEN + "\n📈 OVERSOLD (RSI < 30):" + Style.RESET_ALL)
-        for s, r, p in sorted(oversold, key=lambda x: x[1]):
-            print(f"  {s}: RSI={r:.1f}, ${p:.2f}")
-    if overbought:
-        print(Fore.RED + "\n📉 OVERBOUGHT (RSI > 70):" + Style.RESET_ALL)
-        for s, r, p in sorted(overbought, key=lambda x: -x[1]):
-            print(f"  {s}: RSI={r:.1f}, ${p:.2f}")
-    if golden_cross:
-        print(Fore.YELLOW + "\n⭐ GOLDEN CROSS (Recent):" + Style.RESET_ALL)
-        for s, p in golden_cross:
-            print(f"  {s}: ${p:.2f}")
-    if not oversold and not overbought and not golden_cross:
-        print(Fore.YELLOW + "\nNo significant signals found")
-
-
-# =============================================================================
-# HELP & MAIN
-# =============================================================================
-
-def show_help():
-    print(f"""
-{Fore.CYAN}{'='*60}
-STOCK TICKER APP - COMMAND REFERENCE
-{'='*60}{Style.RESET_ALL}
-
-{Fore.GREEN}ANALYSIS{Style.RESET_ALL}
-  AAPL              Analyze stock (chart + technicals)
-  compare A B C     Compare multiple stocks
-  scan              Scan default stocks for signals
-  scan AAPL MSFT    Scan specific stocks
-
-{Fore.GREEN}PORTFOLIO{Style.RESET_ALL}
-  portfolio         View holdings with live P&L
-  buy AAPL 10 150   Add stock (symbol, shares, cost)
-  sell AAPL         Remove stock position
-  cash 65000        Set cash balance
-  export ~/p.csv    Export portfolio to CSV
-
-{Fore.GREEN}OPTIONS{Style.RESET_ALL}
-  option buy AAPL call 175 2024-03-15 2 3.50
-  option sell TSLA put 200 2024-04-21 1 5.25
-  option close OPTION_ID
-
-{Fore.GREEN}IMPORT FROM BROKERAGES{Style.RESET_ALL}
-  import ~/Downloads/file.csv              Auto-detect
-  import schwab ~/Downloads/txn.csv        Schwab format
-  import fidelity ~/Downloads/Portfolio.csv
-  import etrade ~/Downloads/history.csv
-  import robinhood ~/Downloads/report.csv
-  import thinkorswim ~/Downloads/stmt.csv
-  
-  Supported: Schwab, Fidelity, E*TRADE, Robinhood, thinkorswim
-
-{Fore.GREEN}WATCHLIST{Style.RESET_ALL}
-  watch AAPL 200 150   Add with high/low alerts
-  watch AAPL           Add without alerts
-  unwatch AAPL         Remove from watchlist
-  watchlist            Show watchlist
-
-{Fore.GREEN}SETTINGS{Style.RESET_ALL}
-  charts on/off     Toggle charts
-  theme dark/light  Switch theme
-  refresh           Clear price cache
-  clear portfolio   Clear all positions
-  clear stocks      Clear only stocks
-  clear options     Clear only options
-
-{Fore.GREEN}OTHER{Style.RESET_ALL}
-  help              Show this menu
-  quit / exit / q   Exit
-""")
-
+def print_help():
+    print(Fore.CYAN + """
+╔═══════════════════════════════════════════════════════════════╗
+║  STOCK TICKER v7.7.0 COMMANDS                                 ║
+╠═══════════════════════════════════════════════════════════════╣
+║  pf          Show portfolio    │  import FILE  Import CSV     ║
+║  summary     Quick summary     │  expiring [N] Options <N days║
+║  q SYMBOL    Quote             │  ta SYMBOL    Analysis       ║
+║  greeks SYM  Option Greeks     │  watch        Watchlist      ║
+║  watch add/rm SYMBOL           │  clear        Clear portfolio║
+║  debug/charts on|off           │  refresh      Clear cache    ║
+║  help        This help         │  quit         Exit           ║
+╚═══════════════════════════════════════════════════════════════╝
+""" + Style.RESET_ALL)
 
 def main():
-    print(Fore.CYAN + "\n" + "=" * 60)
-    print("  STOCK TICKER APP - Multi-Brokerage Edition")
-    print("  Supports: Schwab | Fidelity | E*TRADE | Robinhood | TOS")
-    print("=" * 60 + Style.RESET_ALL)
-    print(f"Data directory: {config.data_dir}")
-    print("Type 'help' for commands\n")
-
-    fetcher = DataFetcher()
-    watchlist = WatchlistManager()
-    portfolio = Portfolio()
-
+    print(Fore.CYAN + Style.BRIGHT + "\n    STOCK TICKER v7.7.0 — Live Portfolio Tracking\n" + Style.RESET_ALL)
+    fetcher, portfolio, watchlist = PriceFetcher(), Portfolio(), Watchlist()
+    print(f"  Data: {config.data_dir}\n  Type 'help' for commands\n")
     while True:
         try:
-            inp = input(Fore.CYAN + "> " + Style.RESET_ALL).strip()
-            if not inp:
-                continue
-
-            cmd = inp.lower()
-            parts = inp.split()
-
-            if cmd in ['quit', 'exit', 'q']:
-                break
-            elif cmd == 'help':
-                show_help()
-            elif cmd == 'portfolio':
-                portfolio.display(fetcher)
-            elif cmd == 'refresh':
-                price_cache.clear()
-                print(Fore.GREEN + "Price cache cleared")
-            elif cmd == 'watchlist':
-                watchlist.display(fetcher)
-            elif cmd.startswith('watch '):
-                p = parts[1:]
-                if p:
-                    watchlist.add(p[0], float(p[1]) if len(p) > 1 else None, float(p[2]) if len(p) > 2 else None)
-            elif cmd.startswith('unwatch '):
-                watchlist.remove(parts[1])
-            elif cmd.startswith('buy '):
-                if len(parts) >= 4:
-                    portfolio.add_stock(parts[1], float(parts[2]), float(parts[3]))
-                else:
-                    print("Usage: buy SYMBOL SHARES PRICE")
-            elif cmd.startswith('sell '):
-                portfolio.remove_stock(parts[1])
-            elif cmd.startswith('cash '):
-                try:
-                    portfolio.set_cash(float(parts[1]))
-                except:
-                    print("Usage: cash AMOUNT")
-            elif cmd.startswith('export '):
-                portfolio.export_csv(parts[1] if len(parts) > 1 else '~/portfolio_export.csv')
-            elif cmd.startswith('import '):
-                p = parts[1:]
-                formats = ['schwab', 'fidelity', 'etrade', 'robinhood', 'thinkorswim', 'generic']
-                if len(p) >= 2 and p[0].lower() in formats:
-                    portfolio.import_csv(p[1], p[0])
-                elif len(p) >= 1:
-                    portfolio.import_csv(p[0])
-                else:
-                    print("Usage: import [format] /path/to/file.csv")
-            elif cmd.startswith('clear'):
-                what = cmd[5:].strip()
-                if 'portfolio' in what or not what:
-                    if input("Clear all positions? (yes/no): ").lower() == 'yes':
-                        portfolio.clear()
-                elif 'stock' in what:
-                    portfolio.clear(stocks=True, options=False)
-                elif 'option' in what:
-                    portfolio.clear(stocks=False, options=True)
-            elif cmd.startswith('option '):
-                p = parts[1:]
-                if len(p) >= 7 and p[0] in ['buy', 'sell']:
-                    try:
-                        portfolio.add_option(p[1], p[2], float(p[3]), p[4], int(p[5]), float(p[6]), 'long' if p[0] == 'buy' else 'short')
-                    except Exception as e:
-                        print(Fore.RED + f"Error: {e}")
-                        print("Usage: option buy/sell SYMBOL call/put STRIKE EXPIRY CONTRACTS PREMIUM")
-                elif len(p) >= 2 and p[0] == 'close':
-                    portfolio.remove_option(p[1])
-                else:
-                    print("Usage: option buy/sell SYMBOL call/put STRIKE EXPIRY CONTRACTS PREMIUM")
-            elif cmd.startswith('compare '):
-                compare(parts[1:], fetcher)
-            elif cmd == 'scan':
-                scan(fetcher)
-            elif cmd.startswith('scan '):
-                scan(fetcher, parts[1:])
-            elif cmd.startswith('charts '):
-                config.show_charts = 'on' in cmd
-                print(f"Charts: {'on' if config.show_charts else 'off'}")
-            elif cmd.startswith('theme '):
-                config.theme = 'dark' if 'dark' in cmd else 'light'
-                print(f"Theme: {config.theme}")
-            else:
-                if parts[0].isalpha() or '.' in parts[0]:
-                    analyze(parts[0], fetcher)
-                else:
-                    print(Fore.YELLOW + f"Unknown command: {inp}. Type 'help' for commands.")
-
-        except KeyboardInterrupt:
-            print("\nCancelled")
-        except Exception as e:
-            print(Fore.RED + f"Error: {e}" + Style.RESET_ALL)
-
-    print(Fore.GREEN + "\nGoodbye!" + Style.RESET_ALL)
-
+            raw = input(Fore.GREEN + "▶ " + Style.RESET_ALL).strip()
+            if not raw: continue
+            parts = shlex.split(raw)
+            cmd, args = parts[0].lower(), parts[1:] if len(parts) > 1 else []
+            if cmd in ('quit', 'exit') or (cmd == 'q' and not args): print("Goodbye!"); break
+            elif cmd in ('help', 'h', '?'): print_help()
+            elif cmd in ('pf', 'portfolio'): portfolio.display(fetcher)
+            elif cmd == 'summary': portfolio.summary()
+            elif cmd == 'expiring': portfolio.expiring_soon(int(args[0]) if args else 7)
+            elif cmd == 'import': portfolio.import_csv(args[0]) if args else err("Usage: import FILE")
+            elif cmd == 'clear': portfolio.clear()
+            elif cmd in ('q', 'quote') and args:
+                d = fetcher.get_stock_price(args[0].upper())
+                print(f"  {args[0].upper()}: {fmt_money(d['price'])} ({color_pct(d['pct'])})") if d['price'] > 0 else err(f"Not found: {args[0]}")
+            elif cmd == 'ta' and args: portfolio.analyze_symbol(args[0], fetcher)
+            elif cmd == 'greeks' and args: portfolio.option_greeks(args[0], fetcher)
+            elif cmd == 'watch':
+                if not args: watchlist.display(fetcher)
+                elif args[0] == 'add' and len(args) > 1: watchlist.add(args[1])
+                elif args[0] in ('rm', 'del') and len(args) > 1: watchlist.remove(args[1])
+            elif cmd == 'debug': config.debug = not config.debug if not args else args[0] in ('on', '1'); config.save(); print(f"  Debug: {'ON' if config.debug else 'OFF'}")
+            elif cmd == 'charts': config.show_charts = not config.show_charts if not args else args[0] in ('on', '1'); config.save(); print(f"  Charts: {'ON' if config.show_charts else 'OFF'}")
+            elif cmd == 'refresh': fetcher.clear_cache(); success("Cache cleared")
+            elif len(cmd) <= 5 and cmd.isalpha():
+                d = fetcher.get_stock_price(cmd.upper())
+                print(f"  {cmd.upper()}: {fmt_money(d['price'])} ({color_pct(d['pct'])})") if d['price'] > 0 else err(f"Unknown: {cmd}")
+            else: err(f"Unknown: {cmd}")
+        except KeyboardInterrupt: print("\n  Use 'quit' to exit")
+        except EOFError: break
+        except Exception as e: err(str(e))
 
 if __name__ == "__main__":
     main()
