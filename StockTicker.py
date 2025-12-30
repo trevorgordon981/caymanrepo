@@ -255,47 +255,65 @@ class PriceFetcher:
         cached = self.stock_cache.get(symbol)
         if cached and (_now() - cached['time']) < self.cache_ttl: return cached['data']
         result = {'price': 0, 'prev': 0, 'change': 0, 'pct': 0, 'source': 'none'}
+        
+        # Method 1: Direct Yahoo API (most reliable, try first)
         try:
-            t = yf.Ticker(symbol)
-            # Method 1: fast_info (fastest)
-            if t.fast_info and t.fast_info.last_price:
-                price, prev = t.fast_info.last_price, t.fast_info.previous_close
-                result = {'price': price, 'prev': prev, 'source': 'yfinance_fast', 'change': price - prev, 'pct': (price - prev) / prev * 100 if prev else 0}
-            
-            # Method 2: info dict
-            if result['price'] == 0:
-                try:
-                    info = t.info
-                    price = info.get('regularMarketPrice') or info.get('currentPrice') or info.get('navPrice', 0)
-                    prev = info.get('regularMarketPreviousClose') or info.get('previousClose', 0)
+            resp = requests.get(f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}", 
+                              headers={'User-Agent': 'Mozilla/5.0'}, timeout=5)
+            if resp.status_code == 200:
+                data = resp.json()
+                chart_result = data.get('chart', {}).get('result')
+                if chart_result and len(chart_result) > 0:
+                    meta = chart_result[0].get('meta', {})
+                    price = meta.get('regularMarketPrice', 0)
+                    prev = meta.get('chartPreviousClose') or meta.get('previousClose', 0)
                     if price:
+                        result = {'price': float(price), 'prev': float(prev) if prev else float(price), 'source': 'yahoo_api', 'change': 0, 'pct': 0}
+                        result['change'] = result['price'] - result['prev']
+                        result['pct'] = (result['change']/result['prev']*100) if result['prev'] else 0
+        except Exception as e:
+            if config.debug: print(f"  Debug [{symbol}] yahoo_api error: {e}")
+        
+        # Method 2: yfinance history (reliable fallback)
+        if result['price'] == 0:
+            try:
+                t = yf.Ticker(symbol)
+                hist = t.history(period='5d')
+                if hist is not None and not hist.empty and 'Close' in hist.columns:
+                    price = float(hist['Close'].iloc[-1])
+                    prev = float(hist['Close'].iloc[-2]) if len(hist) > 1 else price
+                    result = {'price': price, 'prev': prev, 'source': 'yfinance_history', 'change': price - prev, 'pct': (price - prev) / prev * 100 if prev else 0}
+            except Exception as e:
+                if config.debug: print(f"  Debug [{symbol}] history error: {e}")
+        
+        # Method 3: yfinance info dict
+        if result['price'] == 0:
+            try:
+                t = yf.Ticker(symbol)
+                info = t.info
+                if info:
+                    price = info.get('regularMarketPrice') or info.get('currentPrice') or info.get('navPrice') or info.get('ask') or 0
+                    prev = info.get('regularMarketPreviousClose') or info.get('previousClose') or price
+                    if price and price > 0:
                         result = {'price': float(price), 'prev': float(prev) if prev else float(price), 'source': 'yfinance_info', 'change': 0, 'pct': 0}
                         result['change'] = result['price'] - result['prev']
                         result['pct'] = (result['change']/result['prev']*100) if result['prev'] else 0
-                except: pass
-            
-            # Method 3: history (most reliable fallback)
-            if result['price'] == 0:
-                try:
-                    hist = t.history(period='5d')
-                    if not hist.empty:
-                        price = float(hist['Close'].iloc[-1])
-                        prev = float(hist['Close'].iloc[-2]) if len(hist) > 1 else price
-                        result = {'price': price, 'prev': prev, 'source': 'yfinance_history', 'change': price - prev, 'pct': (price - prev) / prev * 100 if prev else 0}
-                except: pass
-            
-            # Method 4: Direct Yahoo API
-            if result['price'] == 0:
-                resp = requests.get(f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}", headers={'User-Agent': 'Mozilla/5.0'}, timeout=5)
-                if resp.status_code == 200:
-                    meta = resp.json().get('chart', {}).get('result', [{}])[0].get('meta', {})
-                    price = meta.get('regularMarketPrice', 0)
-                    prev = meta.get('previousClose', 0)
-                    if price:
-                        result = {'price': float(price), 'prev': float(prev) if prev else float(price), 'source': 'yahoo_api', 'change': float(price)-float(prev), 'pct': 0}
-                        result['pct'] = (result['change']/result['prev']*100) if result['prev'] else 0
-        except Exception as e:
-            if config.debug: print(f"Debug: {symbol} fetch error: {e}")
+            except Exception as e:
+                if config.debug: print(f"  Debug [{symbol}] info error: {e}")
+        
+        # Method 4: fast_info (can be buggy with some tickers)
+        if result['price'] == 0:
+            try:
+                t = yf.Ticker(symbol)
+                if t.fast_info and hasattr(t.fast_info, 'last_price') and t.fast_info.last_price:
+                    price, prev = t.fast_info.last_price, t.fast_info.previous_close or t.fast_info.last_price
+                    result = {'price': float(price), 'prev': float(prev), 'source': 'yfinance_fast', 'change': price - prev, 'pct': (price - prev) / prev * 100 if prev else 0}
+            except Exception as e:
+                if config.debug: print(f"  Debug [{symbol}] fast_info error: {e}")
+        
+        if config.debug and result['price'] == 0:
+            print(f"  Debug [{symbol}] ALL METHODS FAILED - no price found")
+        
         if result['price'] > 0: self.stock_cache[symbol] = {'time': _now(), 'data': result}
         return result
 
@@ -328,15 +346,58 @@ class PriceFetcher:
         return result
 
     def get_history(self, symbol, period="6mo", interval="1d"):
+        symbol = symbol.upper().strip()
         key = f"{symbol}_{period}_{interval}"
         cached = self.history_cache.get(key)
         if cached and (_now() - cached['time']) < self.history_ttl: return cached['data']
+        
+        df = None
+        
+        # Method 1: Direct Yahoo API (more reliable)
         try:
-            df = yf.Ticker(symbol).history(period=period, interval=interval)
-            if not df.empty:
-                self.history_cache[key] = {'time': _now(), 'data': df}
-                return df
-        except: pass
+            # Convert period to timestamps
+            period_days = {'1d': 1, '5d': 5, '1mo': 30, '3mo': 90, '6mo': 180, '1y': 365, '2y': 730, '5y': 1825}
+            days = period_days.get(period, 180)
+            end_ts = int(time.time())
+            start_ts = end_ts - (days * 86400)
+            
+            url = f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}?period1={start_ts}&period2={end_ts}&interval={interval}"
+            resp = requests.get(url, headers={'User-Agent': 'Mozilla/5.0'}, timeout=10)
+            
+            if resp.status_code == 200:
+                data = resp.json()
+                result = data.get('chart', {}).get('result', [])
+                if result and len(result) > 0:
+                    timestamps = result[0].get('timestamp', [])
+                    quote = result[0].get('indicators', {}).get('quote', [{}])[0]
+                    
+                    if timestamps and quote:
+                        df = pd.DataFrame({
+                            'Open': quote.get('open', []),
+                            'High': quote.get('high', []),
+                            'Low': quote.get('low', []),
+                            'Close': quote.get('close', []),
+                            'Volume': quote.get('volume', [])
+                        }, index=pd.to_datetime(timestamps, unit='s'))
+                        df = df.dropna()
+                        if not df.empty:
+                            if config.debug: print(f"  Debug [{symbol}] history from yahoo_api: {len(df)} rows")
+        except Exception as e:
+            if config.debug: print(f"  Debug [{symbol}] yahoo_api history error: {e}")
+        
+        # Method 2: yfinance (fallback)
+        if df is None or df.empty:
+            try:
+                df = yf.Ticker(symbol).history(period=period, interval=interval)
+                if df is not None and not df.empty:
+                    if config.debug: print(f"  Debug [{symbol}] history from yfinance: {len(df)} rows")
+            except Exception as e:
+                if config.debug: print(f"  Debug [{symbol}] yfinance history error: {e}")
+        
+        if df is not None and not df.empty:
+            self.history_cache[key] = {'time': _now(), 'data': df}
+            return df
+        
         return None
 
     def get_meta(self, symbol):
@@ -871,18 +932,21 @@ class Watchlist:
 def print_help():
     print(Fore.CYAN + """
 ╔══════════════════════════════════════════════════════════════════════════╗
-║  STOCK TICKER v9.5.0 — HELP & MANUAL                                     ║
+║  STOCK TICKER v9.6.0 — HELP & MANUAL                                     ║
 ╠══════════════════════════════════════════════════════════════════════════╣
 ║  COMMANDS:                                                               ║
 ║  pf            View full portfolio. Shows P&L, Strategy, and Greeks.     ║
 ║  import FILE   Load a CSV file (Fidelity, Schwab, E*Trade supported).    ║
 ║  summary       Quick portfolio total value and day change overview.      ║
 ║  q SYMBOL      Get a live quote for a stock (e.g., 'q AAPL').            ║
+║  ta SYMBOL     Full technical analysis (RSI, MACD, Bollinger, etc).      ║
+║  compare A B   Compare two stocks side-by-side (e.g., 'compare AAPL MSFT')║
 ║  risk          Calculate Portfolio Beta (volatility vs S&P 500).         ║
 ║  cal           Scan portfolio for upcoming earnings and dividends.       ║
 ║  watch         View watchlist. Usage: 'watch add AAPL' or 'watch rm'.    ║
 ║  clear         Delete all current portfolio data (reset).                ║
 ║  refresh       Clear cached price data to force fresh updates.           ║
+║  debug         Toggle debug mode for troubleshooting.                    ║
 ║                                                                          ║
 ║  STRATEGY LEGEND:                                                        ║
 ║  Long          You BOUGHT this option (Positive Qty). Asset.             ║
@@ -899,7 +963,7 @@ def print_help():
 
 # --- MAIN ---
 def main():
-    print(Fore.CYAN + Style.BRIGHT + "\n    STOCK TICKER v9.5.0 — Universal\n" + Style.RESET_ALL)
+    print(Fore.CYAN + Style.BRIGHT + "\n    STOCK TICKER v9.6.0 — Universal\n" + Style.RESET_ALL)
     fetcher, pf, wl = PriceFetcher(), Portfolio(), Watchlist()
     
     while True:
@@ -922,6 +986,185 @@ def main():
             elif cmd == 'debug': config.debug = not config.debug; print(f"Debug: {config.debug}")
             elif cmd == 'refresh': fetcher.clear_cache(); success("Cache cleared")
             elif cmd in ('help', 'h', '?'): print_help()
+            elif cmd == 'ta' and args:
+                # Technical Analysis command: ta SYMBOL
+                symbol = args[0].upper()
+                print(Fore.CYAN + f"\n{'═'*70}\n TECHNICAL ANALYSIS — {symbol}\n{'═'*70}" + Style.RESET_ALL)
+                df = fetcher.get_history(symbol, "6mo")
+                if df is None or len(df) < 30:
+                    err(f"Insufficient data for {symbol}")
+                else:
+                    close = df['Close']
+                    high, low = df['High'], df['Low']
+                    price = close.iloc[-1]
+                    
+                    # Price Info
+                    d = fetcher.get_stock_price(symbol)
+                    print(f"\n{Style.BRIGHT}PRICE{Style.RESET_ALL}")
+                    print(f"  Current:      {fmt_money(price)}")
+                    print(f"  Day Change:   {color_pct(d['pct'])}")
+                    print(f"  52W High:     {fmt_money(high.max())}")
+                    print(f"  52W Low:      {fmt_money(low.min())}")
+                    pct_from_high = ((price - high.max()) / high.max()) * 100
+                    print(f"  From 52W High: {color_pct(pct_from_high)}")
+                    
+                    # RSI
+                    rsi = TechnicalAnalysis.rsi(close)
+                    rsi_val = rsi.iloc[-1]
+                    rsi_signal = "OVERSOLD" if rsi_val < 30 else "OVERBOUGHT" if rsi_val > 70 else "Neutral"
+                    print(f"\n{Style.BRIGHT}RSI (14){Style.RESET_ALL}")
+                    print(f"  Value:  {rsi_val:.2f}")
+                    print(f"  Signal: {color_signal(rsi_signal)}")
+                    
+                    # MACD
+                    macd_line, signal_line, histogram = TechnicalAnalysis.macd(close)
+                    macd_signal = "BULLISH" if histogram.iloc[-1] > 0 else "BEARISH"
+                    print(f"\n{Style.BRIGHT}MACD (12/26/9){Style.RESET_ALL}")
+                    print(f"  MACD Line:    {macd_line.iloc[-1]:.4f}")
+                    print(f"  Signal Line:  {signal_line.iloc[-1]:.4f}")
+                    print(f"  Histogram:    {histogram.iloc[-1]:.4f}")
+                    print(f"  Signal:       {color_signal(macd_signal)}")
+                    
+                    # Bollinger Bands
+                    upper, middle, lower = TechnicalAnalysis.bollinger_bands(close)
+                    bb_pct = (price - lower.iloc[-1]) / (upper.iloc[-1] - lower.iloc[-1]) * 100 if (upper.iloc[-1] - lower.iloc[-1]) > 0 else 50
+                    bb_signal = "OVERSOLD" if bb_pct < 20 else "OVERBOUGHT" if bb_pct > 80 else "Neutral"
+                    print(f"\n{Style.BRIGHT}BOLLINGER BANDS (20/2){Style.RESET_ALL}")
+                    print(f"  Upper:    {fmt_money(upper.iloc[-1])}")
+                    print(f"  Middle:   {fmt_money(middle.iloc[-1])}")
+                    print(f"  Lower:    {fmt_money(lower.iloc[-1])}")
+                    print(f"  %B:       {bb_pct:.1f}%")
+                    print(f"  Signal:   {color_signal(bb_signal)}")
+                    
+                    # Supertrend
+                    trend, st_upper, st_lower = TechnicalAnalysis.supertrend(df)
+                    st_signal = "BULLISH" if trend.iloc[-1] == 1 else "BEARISH"
+                    print(f"\n{Style.BRIGHT}SUPERTREND (10/3){Style.RESET_ALL}")
+                    print(f"  Signal: {color_signal(st_signal)}")
+                    
+                    # ATR
+                    atr = TechnicalAnalysis.atr(df)
+                    atr_pct = (atr.iloc[-1] / price) * 100
+                    print(f"\n{Style.BRIGHT}ATR (14){Style.RESET_ALL}")
+                    print(f"  Value:    {fmt_money(atr.iloc[-1])}")
+                    print(f"  % of Price: {atr_pct:.2f}%")
+                    
+                    # Pivot Points
+                    pivots = TechnicalAnalysis.pivot_points(df)
+                    print(f"\n{Style.BRIGHT}PIVOT POINTS{Style.RESET_ALL}")
+                    print(f"  R3: {fmt_money(pivots['R3'])}  R2: {fmt_money(pivots['R2'])}  R1: {fmt_money(pivots['R1'])}")
+                    print(f"  Pivot: {fmt_money(pivots['P'])}")
+                    print(f"  S1: {fmt_money(pivots['S1'])}  S2: {fmt_money(pivots['S2'])}  S3: {fmt_money(pivots['S3'])}")
+                    
+                    # Moving Averages
+                    sma_20 = close.rolling(20).mean().iloc[-1]
+                    sma_50 = close.rolling(50).mean().iloc[-1]
+                    sma_200 = close.rolling(200).mean().iloc[-1] if len(close) >= 200 else None
+                    print(f"\n{Style.BRIGHT}MOVING AVERAGES{Style.RESET_ALL}")
+                    print(f"  SMA 20:  {fmt_money(sma_20)} {'▲' if price > sma_20 else '▼'}")
+                    print(f"  SMA 50:  {fmt_money(sma_50)} {'▲' if price > sma_50 else '▼'}")
+                    if sma_200:
+                        print(f"  SMA 200: {fmt_money(sma_200)} {'▲' if price > sma_200 else '▼'}")
+                    
+                    # Overall Score
+                    signals = [rsi_signal, macd_signal, bb_signal, st_signal]
+                    bull_count = sum(1 for s in signals if "BULL" in s or "OVERSOLD" in s)
+                    bear_count = sum(1 for s in signals if "BEAR" in s or "OVERBOUGHT" in s)
+                    overall = "BULLISH" if bull_count > bear_count else "BEARISH" if bear_count > bull_count else "NEUTRAL"
+                    print(f"\n{Style.BRIGHT}OVERALL{Style.RESET_ALL}")
+                    print(f"  Score: {bull_count} Bull / {bear_count} Bear")
+                    print(f"  Bias:  {color_signal(overall)}")
+                    print(f"{'═'*70}\n")
+            
+            elif cmd == 'compare' and len(args) >= 2:
+                # Compare two stocks: compare SYMBOL1 SYMBOL2
+                sym1, sym2 = args[0].upper(), args[1].upper()
+                print(Fore.CYAN + f"\n{'═'*80}\n COMPARISON — {sym1} vs {sym2}\n{'═'*80}" + Style.RESET_ALL)
+                
+                df1, df2 = fetcher.get_history(sym1, "6mo"), fetcher.get_history(sym2, "6mo")
+                d1, d2 = fetcher.get_stock_price(sym1), fetcher.get_stock_price(sym2)
+                
+                if df1 is None or df2 is None or len(df1) < 30 or len(df2) < 30:
+                    err("Insufficient data for comparison")
+                else:
+                    # Helper to get all metrics
+                    def get_metrics(df, d):
+                        close = df['Close']
+                        price = close.iloc[-1]
+                        rsi = TechnicalAnalysis.rsi(close).iloc[-1]
+                        _, _, hist = TechnicalAnalysis.macd(close)
+                        upper, middle, lower = TechnicalAnalysis.bollinger_bands(close)
+                        bb_pct = (price - lower.iloc[-1]) / (upper.iloc[-1] - lower.iloc[-1]) * 100 if (upper.iloc[-1] - lower.iloc[-1]) > 0 else 50
+                        trend, _, _ = TechnicalAnalysis.supertrend(df)
+                        atr = TechnicalAnalysis.atr(df).iloc[-1]
+                        
+                        # Performance
+                        pct_1w = ((price - close.iloc[-5]) / close.iloc[-5] * 100) if len(close) >= 5 else 0
+                        pct_1m = ((price - close.iloc[-21]) / close.iloc[-21] * 100) if len(close) >= 21 else 0
+                        pct_3m = ((price - close.iloc[-63]) / close.iloc[-63] * 100) if len(close) >= 63 else 0
+                        
+                        return {
+                            'price': price, 'day_pct': d['pct'],
+                            'pct_1w': pct_1w, 'pct_1m': pct_1m, 'pct_3m': pct_3m,
+                            'rsi': rsi, 'macd_hist': hist.iloc[-1], 'bb_pct': bb_pct,
+                            'trend': trend.iloc[-1], 'atr': atr, 'atr_pct': (atr/price)*100,
+                            'volatility': close.pct_change().std() * np.sqrt(252) * 100
+                        }
+                    
+                    m1, m2 = get_metrics(df1, d1), get_metrics(df2, d2)
+                    
+                    # Build comparison table
+                    def winner(v1, v2, higher_better=True):
+                        if higher_better:
+                            return (Fore.GREEN + "◀" + Style.RESET_ALL, "") if v1 > v2 else ("", Fore.GREEN + "▶" + Style.RESET_ALL) if v2 > v1 else ("", "")
+                        else:
+                            return (Fore.GREEN + "◀" + Style.RESET_ALL, "") if v1 < v2 else ("", Fore.GREEN + "▶" + Style.RESET_ALL) if v2 < v1 else ("", "")
+                    
+                    rows = []
+                    
+                    # Price
+                    rows.append(["Price", fmt_money(m1['price']), "", fmt_money(m2['price'])])
+                    
+                    # Performance
+                    w = winner(m1['day_pct'], m2['day_pct'])
+                    rows.append(["Day %", color_pct(m1['day_pct']), w[0], color_pct(m2['day_pct']) + " " + w[1]])
+                    w = winner(m1['pct_1w'], m2['pct_1w'])
+                    rows.append(["1 Week %", color_pct(m1['pct_1w']), w[0], color_pct(m2['pct_1w']) + " " + w[1]])
+                    w = winner(m1['pct_1m'], m2['pct_1m'])
+                    rows.append(["1 Month %", color_pct(m1['pct_1m']), w[0], color_pct(m2['pct_1m']) + " " + w[1]])
+                    w = winner(m1['pct_3m'], m2['pct_3m'])
+                    rows.append(["3 Month %", color_pct(m1['pct_3m']), w[0], color_pct(m2['pct_3m']) + " " + w[1]])
+                    
+                    rows.append(["─"*12, "─"*15, "─", "─"*15])
+                    
+                    # Technicals
+                    rsi1_sig = "OVERSOLD" if m1['rsi'] < 30 else "OVERBOUGHT" if m1['rsi'] > 70 else "Neutral"
+                    rsi2_sig = "OVERSOLD" if m2['rsi'] < 30 else "OVERBOUGHT" if m2['rsi'] > 70 else "Neutral"
+                    rows.append(["RSI", f"{m1['rsi']:.1f} ({color_signal(rsi1_sig)})", "", f"{m2['rsi']:.1f} ({color_signal(rsi2_sig)})"])
+                    
+                    macd1_sig = "BULLISH" if m1['macd_hist'] > 0 else "BEARISH"
+                    macd2_sig = "BULLISH" if m2['macd_hist'] > 0 else "BEARISH"
+                    rows.append(["MACD", color_signal(macd1_sig), "", color_signal(macd2_sig)])
+                    
+                    bb1_sig = "OVERSOLD" if m1['bb_pct'] < 20 else "OVERBOUGHT" if m1['bb_pct'] > 80 else "Neutral"
+                    bb2_sig = "OVERSOLD" if m2['bb_pct'] < 20 else "OVERBOUGHT" if m2['bb_pct'] > 80 else "Neutral"
+                    rows.append(["Bollinger %B", f"{m1['bb_pct']:.0f}% ({color_signal(bb1_sig)})", "", f"{m2['bb_pct']:.0f}% ({color_signal(bb2_sig)})"])
+                    
+                    st1_sig = "BULLISH" if m1['trend'] == 1 else "BEARISH"
+                    st2_sig = "BULLISH" if m2['trend'] == 1 else "BEARISH"
+                    rows.append(["Supertrend", color_signal(st1_sig), "", color_signal(st2_sig)])
+                    
+                    rows.append(["─"*12, "─"*15, "─", "─"*15])
+                    
+                    # Risk
+                    w = winner(m1['volatility'], m2['volatility'], higher_better=False)
+                    rows.append(["Volatility", f"{m1['volatility']:.1f}%", w[0], f"{m2['volatility']:.1f}% " + w[1]])
+                    w = winner(m1['atr_pct'], m2['atr_pct'], higher_better=False)
+                    rows.append(["ATR %", f"{m1['atr_pct']:.2f}%", w[0], f"{m2['atr_pct']:.2f}% " + w[1]])
+                    
+                    print(tabulate(rows, headers=["Metric", sym1, "", sym2], tablefmt="simple"))
+                    print(f"{'═'*80}\n")
+            
             elif cmd == 'q' and args:
                 # Quote command: q SYMBOL
                 symbol = args[0].upper()
