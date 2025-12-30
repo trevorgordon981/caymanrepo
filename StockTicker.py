@@ -1278,7 +1278,7 @@ class Portfolio:
         print(f"{'═'*70}\n")
     
     def quick_stats(self, fetcher):
-        """Quick portfolio health stats at a glance"""
+        """Quick portfolio health stats at a glance - options friendly with delta exposure"""
         stocks = self.data.get('stocks', {})
         options = self.data.get('options', [])
         cash = self.data.get('cash', 0)
@@ -1287,71 +1287,235 @@ class Portfolio:
             warn("No positions in portfolio")
             return
         
-        print(Fore.CYAN + f"\n{'═'*60}\n ⚡ QUICK STATS\n{'═'*60}" + Style.RESET_ALL)
+        print(Fore.CYAN + f"\n{'═'*70}\n ⚡ QUICK STATS\n{'═'*70}" + Style.RESET_ALL)
         
-        # Gather data
-        total_value = cash
+        # Gather all underlying symbols for price fetching
+        all_symbols = set(stocks.keys()) | set(o['symbol'] for o in options)
+        stock_prices = {}
+        
+        # Phase 1: Fetch underlying prices
+        if all_symbols:
+            prog = ProgressBar(len(all_symbols), "  Stocks ")
+            with ThreadPoolExecutor(max_workers=10) as executor:
+                futures = {executor.submit(fetcher.get_stock_price, sym): sym for sym in all_symbols}
+                for i, f in enumerate(as_completed(futures)):
+                    sym = futures[f]
+                    stock_prices[sym] = f.result()
+                    prog.update(i + 1, sym)
+            prog.done()
+        
+        # Track all positions (stocks + options)
+        all_positions = []  # List of (name, value, cost, pnl_pct, type)
+        total_stock_value = 0
+        total_option_value = 0
         total_cost = 0
-        gainers, losers = 0, 0
-        best_stock, worst_stock = None, None
-        best_pct, worst_pct = -999, 999
-        sector_exposure = {}
+        delta_exposure = {}  # Track DELTA-ADJUSTED exposure by underlying (in equivalent shares)
+        total_portfolio_delta = 0  # Net delta in dollar terms
         
+        # Process stocks - stocks have delta of 1.0 per share
         for sym, pos in stocks.items():
-            d = fetcher.get_stock_price(sym)
-            price = d['price']
+            price = stock_prices.get(sym, {}).get('price', 0)
             if price > 0:
                 val = pos['qty'] * price
                 cost = pos['cost']
                 pnl_pct = ((val - cost) / cost * 100) if cost > 0 else 0
                 
-                total_value += val
+                total_stock_value += val
                 total_cost += cost
                 
-                if pnl_pct > 0:
-                    gainers += 1
-                else:
-                    losers += 1
+                # Stock delta = qty shares (delta of 1.0 each)
+                delta_exposure[sym] = delta_exposure.get(sym, 0) + pos['qty']
+                total_portfolio_delta += val  # Dollar delta
                 
-                if pnl_pct > best_pct:
-                    best_pct = pnl_pct
-                    best_stock = sym
-                if pnl_pct < worst_pct:
-                    worst_pct = pnl_pct
-                    worst_stock = sym
-                
-                # Get sector
-                meta = fetcher.get_meta(sym)
-                sector = meta.get('sector', 'Unknown')
-                sector_exposure[sector] = sector_exposure.get(sector, 0) + val
+                all_positions.append((sym, val, cost, pnl_pct, 'stock'))
         
-        # Calculate stats
-        total_pnl = total_value - total_cost - cash
+        # Phase 2: Process options with delta calculation
+        option_stats = {'long_calls': 0, 'long_puts': 0, 'short_calls': 0, 'short_puts': 0}
+        options_by_expiry = {}
+        option_data_cache = {}
+        
+        # Fetch option prices in parallel
+        if options:
+            prog = ProgressBar(len(options), "  Options")
+            
+            def fetch_opt(o):
+                und_price = stock_prices.get(o['symbol'], {}).get('price', 0)
+                return fetcher.get_option_price(o['symbol'], o['expiration'], o['strike'], o['type'], und_price)
+            
+            with ThreadPoolExecutor(max_workers=10) as executor:
+                futures = {executor.submit(fetch_opt, o): i for i, o in enumerate(options)}
+                for f in as_completed(futures):
+                    idx = futures[f]
+                    option_data_cache[idx] = f.result()
+                    prog.update(len(option_data_cache), options[idx]['symbol'])
+            prog.done()
+        
+        # Now process all options with cached data
+        for i, o in enumerate(options):
+            und_price = stock_prices.get(o['symbol'], {}).get('price', 0)
+            opt_data = option_data_cache.get(i, {'price': 0, 'iv': 0.5})
+            
+            qty = o['qty']
+            cost = o['cost']
+            price = opt_data['price'] if opt_data['price'] > 0 else o.get('broker_price', 0)
+            iv = opt_data.get('iv', 0.5)  # Implied volatility, default 50%
+            
+            # Calculate current value
+            val = abs(qty) * price * 100
+            
+            # Calculate delta using Black-Scholes
+            days = dte(o['expiration'])
+            T = max(days / 365.0, 0.001)  # Time to expiry in years, minimum to avoid div by zero
+            
+            if und_price > 0 and HAS_SCIPY:
+                # Get Greeks from Black-Scholes
+                greeks = BlackScholes.calculate_all_greeks(
+                    und_price, o['strike'], T, config.risk_free_rate, iv, o['type']
+                )
+                delta = greeks['delta']
+            else:
+                # Fallback: estimate delta based on moneyness
+                if o['type'] == 'call':
+                    if und_price > o['strike'] * 1.1:  # Deep ITM
+                        delta = 0.9
+                    elif und_price > o['strike']:  # ITM
+                        delta = 0.6 + 0.3 * ((und_price - o['strike']) / o['strike'])
+                    elif und_price > o['strike'] * 0.95:  # ATM
+                        delta = 0.5
+                    elif und_price > o['strike'] * 0.9:  # OTM
+                        delta = 0.3
+                    else:  # Deep OTM
+                        delta = 0.1
+                else:  # Put
+                    if und_price < o['strike'] * 0.9:  # Deep ITM put
+                        delta = -0.9
+                    elif und_price < o['strike']:  # ITM put
+                        delta = -0.6 - 0.3 * ((o['strike'] - und_price) / o['strike'])
+                    elif und_price < o['strike'] * 1.05:  # ATM put
+                        delta = -0.5
+                    elif und_price < o['strike'] * 1.1:  # OTM put
+                        delta = -0.3
+                    else:  # Deep OTM put
+                        delta = -0.1
+            
+            # For short options, value is negative (liability)
+            is_short = qty < 0
+            if is_short:
+                avg_price = (cost / abs(qty) / 100) if abs(qty) > 0 else 0
+                pnl = (avg_price - price) * abs(qty) * 100
+                pnl_pct = (pnl / cost * 100) if cost > 0 else 0
+                total_option_value -= val  # Liability
+            else:
+                pnl = val - cost
+                pnl_pct = ((val - cost) / cost * 100) if cost > 0 else 0
+                total_option_value += val  # Asset
+            
+            total_cost += cost
+            
+            # DELTA-ADJUSTED EXPOSURE
+            equivalent_shares = delta * qty * 100
+            delta_exposure[o['symbol']] = delta_exposure.get(o['symbol'], 0) + equivalent_shares
+            
+            # Dollar delta for portfolio
+            if und_price > 0:
+                total_portfolio_delta += equivalent_shares * und_price
+            
+            # Option type stats
+            if is_short:
+                if o['type'] == 'call':
+                    option_stats['short_calls'] += abs(qty)
+                else:
+                    option_stats['short_puts'] += abs(qty)
+            else:
+                if o['type'] == 'call':
+                    option_stats['long_calls'] += abs(qty)
+                else:
+                    option_stats['long_puts'] += abs(qty)
+            
+            # Track by expiry
+            exp = o['expiration']
+            if exp not in options_by_expiry:
+                options_by_expiry[exp] = {'count': 0, 'value': 0}
+            options_by_expiry[exp]['count'] += abs(qty)
+            options_by_expiry[exp]['value'] += val if not is_short else -val
+            
+            # Create position name
+            pos_name = f"{o['symbol']} {o['expiration'][5:]} ${o['strike']:.0f}{o['type'][0].upper()}"
+            if is_short:
+                pos_name = f"-{pos_name}"
+            
+            all_positions.append((pos_name, val if not is_short else -val, cost, pnl_pct, 'option'))
+        
+        # Calculate totals
+        net_liq = cash + total_stock_value + total_option_value
+        total_pnl = net_liq - total_cost - cash
         total_pnl_pct = (total_pnl / total_cost * 100) if total_cost > 0 else 0
         
-        print(f"\n  {Style.BRIGHT}Portfolio Value:{Style.RESET_ALL}  {fmt_money(total_value)}")
-        print(f"  {Style.BRIGHT}Total P&L:{Style.RESET_ALL}         {color_pnl(total_pnl, total_pnl_pct)}")
-        print(f"  {Style.BRIGHT}Cash:{Style.RESET_ALL}              {fmt_money(cash)}")
+        # Count winners/losers
+        gainers = sum(1 for p in all_positions if p[3] > 0)
+        losers = sum(1 for p in all_positions if p[3] <= 0)
         
-        print(f"\n  {Style.BRIGHT}Positions:{Style.RESET_ALL}        {len(stocks)} stocks, {len(options)} options")
-        print(f"  {Style.BRIGHT}Win/Loss:{Style.RESET_ALL}         {Fore.GREEN}{gainers} winners{Style.RESET_ALL} / {Fore.RED}{losers} losers{Style.RESET_ALL}")
+        # Find best/worst performers
+        if all_positions:
+            best = max(all_positions, key=lambda x: x[3])
+            worst = min(all_positions, key=lambda x: x[3])
+        else:
+            best = worst = None
         
-        if best_stock:
-            print(f"\n  {Style.BRIGHT}Best Performer:{Style.RESET_ALL}  {best_stock} ({color_pct(best_pct)})")
-        if worst_stock:
-            print(f"  {Style.BRIGHT}Worst Performer:{Style.RESET_ALL} {worst_stock} ({color_pct(worst_pct)})")
+        # Display results
+        print(f"\n  {Style.BRIGHT}NET LIQUIDATION:{Style.RESET_ALL}   {fmt_money(net_liq)}")
+        print(f"  {Style.BRIGHT}Total P&L:{Style.RESET_ALL}          {color_pnl(total_pnl, total_pnl_pct)}")
         
-        # Top sectors
-        if sector_exposure:
-            print(f"\n  {Style.BRIGHT}Sector Breakdown:{Style.RESET_ALL}")
-            sorted_sectors = sorted(sector_exposure.items(), key=lambda x: x[1], reverse=True)[:5]
-            for sector, val in sorted_sectors:
-                pct = (val / total_value * 100) if total_value > 0 else 0
-                bar_len = int(pct / 5)
-                bar = "█" * bar_len
-                print(f"    {sector[:15]:<15} {bar:<20} {pct:.1f}%")
+        print(f"\n  {Style.BRIGHT}BREAKDOWN:{Style.RESET_ALL}")
+        print(f"    Cash:              {fmt_money(cash)}")
+        print(f"    Stock Value:       {fmt_money(total_stock_value)}")
+        print(f"    Options Value:     {fmt_money(total_option_value)} {'(net liability)' if total_option_value < 0 else ''}")
         
-        print(f"\n{'═'*60}\n")
+        print(f"\n  {Style.BRIGHT}POSITIONS:{Style.RESET_ALL}         {len(stocks)} stocks, {len(options)} options")
+        print(f"  {Style.BRIGHT}Win/Loss:{Style.RESET_ALL}          {Fore.GREEN}{gainers} winners{Style.RESET_ALL} / {Fore.RED}{losers} losers{Style.RESET_ALL}")
+        
+        # Options breakdown
+        if options:
+            print(f"\n  {Style.BRIGHT}OPTIONS BREAKDOWN:{Style.RESET_ALL}")
+            print(f"    Long Calls:  {option_stats['long_calls']:>3} contracts")
+            print(f"    Long Puts:   {option_stats['long_puts']:>3} contracts")
+            print(f"    Short Calls: {option_stats['short_calls']:>3} contracts")
+            print(f"    Short Puts:  {option_stats['short_puts']:>3} contracts")
+        
+        # Expiration timeline
+        if options_by_expiry:
+            print(f"\n  {Style.BRIGHT}EXPIRATION TIMELINE:{Style.RESET_ALL}")
+            sorted_expiries = sorted(options_by_expiry.items(), key=lambda x: x[0])[:5]
+            for exp, data in sorted_expiries:
+                days = dte(exp)
+                urgency = Fore.RED if days <= 7 else Fore.YELLOW if days <= 30 else Fore.RESET
+                print(f"    {urgency}{exp}{Style.RESET_ALL}: {data['count']} contracts ({days}d)")
+        
+        # Best/Worst performers
+        if best:
+            print(f"\n  {Style.BRIGHT}Best Performer:{Style.RESET_ALL}   {best[0]} ({color_pct(best[3])})")
+        if worst:
+            print(f"  {Style.BRIGHT}Worst Performer:{Style.RESET_ALL}  {worst[0]} ({color_pct(worst[3])})")
+        
+        # DELTA-ADJUSTED EXPOSURE (equivalent shares)
+        if delta_exposure:
+            print(f"\n  {Style.BRIGHT}DELTA EXPOSURE (equivalent shares):{Style.RESET_ALL}")
+            sorted_exp = sorted(delta_exposure.items(), key=lambda x: abs(x[1]), reverse=True)[:6]
+            for sym, eq_shares in sorted_exp:
+                if abs(eq_shares) < 1:  # Skip negligible positions
+                    continue
+                direction = Fore.GREEN + "LONG" if eq_shares > 0 else Fore.RED + "SHORT"
+                price = stock_prices.get(sym, {}).get('price', 0)
+                dollar_exp = abs(eq_shares) * price if price > 0 else 0
+                print(f"    {sym:<6} {direction}{Style.RESET_ALL} {abs(eq_shares):>7.0f} shares (≈{fmt_money(dollar_exp)})")
+            
+            # Net portfolio delta
+            net_direction = "BULLISH" if total_portfolio_delta > 0 else "BEARISH"
+            net_color = Fore.GREEN if total_portfolio_delta > 0 else Fore.RED
+            print(f"\n  {Style.BRIGHT}NET PORTFOLIO DELTA:{Style.RESET_ALL} {net_color}{net_direction}{Style.RESET_ALL} {fmt_money(abs(total_portfolio_delta))}")
+            print(f"  {Fore.CYAN}(If market moves $1, portfolio moves ~${abs(total_portfolio_delta)/1000:.0f} per $1000 exposure){Style.RESET_ALL}")
+        
+        print(f"\n{'═'*70}\n")
 
 # --- WATCHLIST ---
 class Watchlist:
