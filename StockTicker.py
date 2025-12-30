@@ -1,7 +1,16 @@
 #!/usr/bin/env python3
 """
-STOCK TICKER APP v9.6.0 — Universal Portfolio Tracker & Analyzer
+STOCK TICKER APP v10.1.0 — Universal Portfolio Tracker & Analyzer
 INSTALL: pip install yfinance pandas numpy matplotlib tabulate colorama requests scipy
+
+NEW IN v10.1.0:
+- Smart Context: Commands remember last symbol used
+- News Command: Get latest headlines for any stock
+- Dashboard: Quick overview with price, trend, and headlines
+- Extended Technical Analysis (ta2): Stochastic, ADX, Williams %R, CCI, MFI, VWAP, Ichimoku, OBV
+- Support/Resistance Levels (levels): Fibonacci, pivot points, key price levels
+- Trend Analysis (trend): Comprehensive trend strength scoring
+- Detailed Quote (quote/info): Full fundamentals and analyst ratings
 """
 from __future__ import annotations
 import os, re, sys, json, time, math, shlex, logging, warnings
@@ -9,6 +18,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional
+from concurrent.futures import ThreadPoolExecutor
 warnings.filterwarnings("ignore")
 import pandas as pd
 import numpy as np
@@ -168,7 +178,7 @@ class BlackScholes:
         except: return 0.0
     @staticmethod
     def calculate_all_greeks(S, K, T, r, sigma, option_type='call'):
-        if not HAS_SCIPY: return {'delta':0,'gamma':0,'theta':0,'vega':0,'rho':0}
+        if not HAS_SCIPY or T <= 0 or sigma <= 0 or S <= 0: return {'delta':0,'gamma':0,'theta':0,'vega':0,'rho':0}
         try:
             d1 = (math.log(S / K) + (r + 0.5 * sigma ** 2) * T) / (sigma * math.sqrt(T))
             d2 = d1 - sigma * math.sqrt(T)
@@ -176,8 +186,43 @@ class BlackScholes:
             gamma = norm.pdf(d1)/(S*sigma*math.sqrt(T))
             vega = S*norm.pdf(d1)*math.sqrt(T)/100
             theta = (-S*norm.pdf(d1)*sigma/(2*math.sqrt(T)) - r*K*math.exp(-r*T)*norm.cdf(d2 if option_type=='call' else -d2))/365
-            return {'delta':delta, 'gamma':gamma, 'theta':theta, 'vega':vega, 'rho':0}
+            rho = K * T * math.exp(-r * T) * norm.cdf(d2 if option_type == 'call' else -d2) / 100
+            if option_type == 'put': rho = -K * T * math.exp(-r * T) * norm.cdf(-d2) / 100
+            return {'delta':delta, 'gamma':gamma, 'theta':theta, 'vega':vega, 'rho':rho}
         except: return {'delta':0,'gamma':0,'theta':0,'vega':0,'rho':0}
+    @staticmethod
+    def implied_volatility(market_price, S, K, T, r, option_type='call', max_iterations=100, precision=1.0e-5):
+        """Calculate implied volatility using Newton-Raphson method"""
+        if not HAS_SCIPY or T <= 0 or market_price <= 0: return 0.5
+        sigma = 0.5
+        for i in range(max_iterations):
+            price = BlackScholes.price(S, K, T, r, sigma, option_type)
+            vega = BlackScholes.calculate_all_greeks(S, K, T, r, sigma, option_type)['vega'] * 100
+            if abs(vega) < 1e-10: break
+            diff = market_price - price
+            if abs(diff) < precision: return sigma
+            sigma += diff / vega
+            sigma = max(0.01, min(sigma, 5.0))
+        return sigma
+    @staticmethod
+    def probability_itm(S, K, T, r, sigma, option_type='call'):
+        """Calculate probability of option expiring in the money"""
+        if not HAS_SCIPY or T <= 0 or sigma <= 0: return 0.0
+        try:
+            d2 = (math.log(S / K) + (r - 0.5 * sigma ** 2) * T) / (sigma * math.sqrt(T))
+            return norm.cdf(d2) if option_type == 'call' else norm.cdf(-d2)
+        except: return 0.0
+    @staticmethod
+    def probability_profit(S, K, premium, T, r, sigma, option_type='call', is_long=True):
+        """Calculate probability of profit for an option position"""
+        if not HAS_SCIPY or T <= 0 or sigma <= 0: return 0.0
+        try:
+            breakeven = K + premium if option_type == 'call' else K - premium
+            d2 = (math.log(S / breakeven) + (r - 0.5 * sigma ** 2) * T) / (sigma * math.sqrt(T))
+            if option_type == 'call':
+                return norm.cdf(d2) if is_long else norm.cdf(-d2)
+            return norm.cdf(-d2) if is_long else norm.cdf(d2)
+        except: return 0.0
 
 class TechnicalAnalysis:
     @staticmethod
@@ -223,6 +268,145 @@ class TechnicalAnalysis:
         h, l, c = df['High'].iloc[-1], df['Low'].iloc[-1], df['Close'].iloc[-1]
         p = (h + l + c) / 3
         return {'P': p, 'R1': 2*p-l, 'S1': 2*p-h, 'R2': p+(h-l), 'S2': p-(h-l), 'R3': h+2*(p-l), 'S3': l-2*(h-p)}
+
+    @staticmethod
+    def stochastic(df, k_period=14, d_period=3, smooth_k=3):
+        """Stochastic Oscillator (%K and %D)"""
+        low_min = df['Low'].rolling(k_period).min()
+        high_max = df['High'].rolling(k_period).max()
+        stoch_k = 100 * (df['Close'] - low_min) / (high_max - low_min)
+        stoch_k = stoch_k.rolling(smooth_k).mean()
+        stoch_d = stoch_k.rolling(d_period).mean()
+        return stoch_k, stoch_d
+
+    @staticmethod
+    def adx(df, period=14):
+        """Average Directional Index (ADX) with +DI and -DI"""
+        high, low, close = df['High'], df['Low'], df['Close']
+        plus_dm = high.diff()
+        minus_dm = low.diff().abs() * -1
+        plus_dm = plus_dm.where((plus_dm > minus_dm.abs()) & (plus_dm > 0), 0)
+        minus_dm = minus_dm.abs().where((minus_dm.abs() > plus_dm) & (minus_dm.abs() > 0), 0)
+        tr = pd.concat([high - low, (high - close.shift()).abs(), (low - close.shift()).abs()], axis=1).max(axis=1)
+        atr = tr.rolling(period).mean()
+        plus_di = 100 * (plus_dm.rolling(period).mean() / atr)
+        minus_di = 100 * (minus_dm.rolling(period).mean() / atr)
+        dx = 100 * (plus_di - minus_di).abs() / (plus_di + minus_di).replace(0, np.nan)
+        adx_val = dx.rolling(period).mean()
+        return adx_val, plus_di, minus_di
+
+    @staticmethod
+    def obv(df):
+        """On-Balance Volume"""
+        obv = pd.Series(0.0, index=df.index)
+        obv.iloc[0] = df['Volume'].iloc[0]
+        for i in range(1, len(df)):
+            if df['Close'].iloc[i] > df['Close'].iloc[i-1]:
+                obv.iloc[i] = obv.iloc[i-1] + df['Volume'].iloc[i]
+            elif df['Close'].iloc[i] < df['Close'].iloc[i-1]:
+                obv.iloc[i] = obv.iloc[i-1] - df['Volume'].iloc[i]
+            else:
+                obv.iloc[i] = obv.iloc[i-1]
+        return obv
+
+    @staticmethod
+    def vwap(df):
+        """Volume Weighted Average Price"""
+        typical_price = (df['High'] + df['Low'] + df['Close']) / 3
+        return (typical_price * df['Volume']).cumsum() / df['Volume'].cumsum()
+
+    @staticmethod
+    def williams_r(df, period=14):
+        """Williams %R"""
+        high_max = df['High'].rolling(period).max()
+        low_min = df['Low'].rolling(period).min()
+        return -100 * (high_max - df['Close']) / (high_max - low_min)
+
+    @staticmethod
+    def cci(df, period=20):
+        """Commodity Channel Index"""
+        typical_price = (df['High'] + df['Low'] + df['Close']) / 3
+        sma = typical_price.rolling(period).mean()
+        mad = typical_price.rolling(period).apply(lambda x: np.abs(x - x.mean()).mean())
+        return (typical_price - sma) / (0.015 * mad)
+
+    @staticmethod
+    def mfi(df, period=14):
+        """Money Flow Index"""
+        typical_price = (df['High'] + df['Low'] + df['Close']) / 3
+        raw_money_flow = typical_price * df['Volume']
+        positive_flow = pd.Series(0.0, index=df.index)
+        negative_flow = pd.Series(0.0, index=df.index)
+        for i in range(1, len(df)):
+            if typical_price.iloc[i] > typical_price.iloc[i-1]:
+                positive_flow.iloc[i] = raw_money_flow.iloc[i]
+            elif typical_price.iloc[i] < typical_price.iloc[i-1]:
+                negative_flow.iloc[i] = raw_money_flow.iloc[i]
+        positive_mf = positive_flow.rolling(period).sum()
+        negative_mf = negative_flow.rolling(period).sum()
+        return 100 - (100 / (1 + positive_mf / negative_mf.replace(0, np.nan)))
+
+    @staticmethod
+    def fibonacci_retracement(df, lookback=50):
+        """Calculate Fibonacci retracement levels"""
+        high = df['High'].tail(lookback).max()
+        low = df['Low'].tail(lookback).min()
+        diff = high - low
+        return {
+            '0.0% (High)': high, '23.6%': high - diff * 0.236, '38.2%': high - diff * 0.382,
+            '50.0%': high - diff * 0.5, '61.8%': high - diff * 0.618, '78.6%': high - diff * 0.786,
+            '100.0% (Low)': low
+        }
+
+    @staticmethod
+    def ichimoku(df, tenkan=9, kijun=26, senkou_b=52):
+        """Ichimoku Cloud"""
+        tenkan_sen = (df['High'].rolling(tenkan).max() + df['Low'].rolling(tenkan).min()) / 2
+        kijun_sen = (df['High'].rolling(kijun).max() + df['Low'].rolling(kijun).min()) / 2
+        senkou_span_a = ((tenkan_sen + kijun_sen) / 2).shift(kijun)
+        senkou_span_b = ((df['High'].rolling(senkou_b).max() + df['Low'].rolling(senkou_b).min()) / 2).shift(kijun)
+        return {'tenkan_sen': tenkan_sen, 'kijun_sen': kijun_sen, 'senkou_span_a': senkou_span_a, 'senkou_span_b': senkou_span_b}
+
+    @staticmethod
+    def support_resistance(df, window=20, num_levels=3):
+        """Find key support and resistance levels"""
+        highs = df['High'].rolling(window, center=True).max()
+        lows = df['Low'].rolling(window, center=True).min()
+        resistance_levels, support_levels = [], []
+        for i in range(window, len(df) - window):
+            if df['High'].iloc[i] == highs.iloc[i]: resistance_levels.append(df['High'].iloc[i])
+            if df['Low'].iloc[i] == lows.iloc[i]: support_levels.append(df['Low'].iloc[i])
+        current_price = df['Close'].iloc[-1]
+        resistance = sorted(set([r for r in resistance_levels if r > current_price]))[:num_levels]
+        support = sorted(set([s for s in support_levels if s < current_price]), reverse=True)[:num_levels]
+        return {'support': support, 'resistance': resistance}
+
+    @staticmethod
+    def trend_strength(df):
+        """Calculate trend strength using multiple indicators"""
+        close = df['Close']
+        sma_20 = close.rolling(20).mean().iloc[-1]
+        sma_50 = close.rolling(50).mean().iloc[-1]
+        sma_200 = close.rolling(200).mean().iloc[-1] if len(close) >= 200 else sma_50
+        current = close.iloc[-1]
+        ma_score = sum([1 if current > sma_20 else -1, 1 if current > sma_50 else -1, 1 if current > sma_200 else -1,
+                       1 if sma_20 > sma_50 else -1, 1 if sma_50 > sma_200 else -1])
+        adx_val, plus_di, minus_di = TechnicalAnalysis.adx(df)
+        adx = adx_val.iloc[-1] if not pd.isna(adx_val.iloc[-1]) else 0
+        trend_direction = 1 if plus_di.iloc[-1] > minus_di.iloc[-1] else -1
+        rsi_score = 1 if TechnicalAnalysis.rsi(close).iloc[-1] > 50 else -1
+        _, _, hist = TechnicalAnalysis.macd(close)
+        macd_score = 1 if hist.iloc[-1] > 0 else -1
+        total_score = ma_score + (2 * trend_direction if adx > 25 else trend_direction) + rsi_score + macd_score
+        if total_score >= 6: strength = "STRONG UPTREND"
+        elif total_score >= 3: strength = "UPTREND"
+        elif total_score >= 1: strength = "WEAK UPTREND"
+        elif total_score >= -1: strength = "NEUTRAL"
+        elif total_score >= -3: strength = "WEAK DOWNTREND"
+        elif total_score >= -6: strength = "DOWNTREND"
+        else: strength = "STRONG DOWNTREND"
+        return {'score': total_score, 'strength': strength, 'adx': adx}
+
     @staticmethod
     def analyze(df, symbol):
         if df is None or len(df) < 30: return {'error': 'Insufficient Data'}
@@ -932,47 +1116,79 @@ class Watchlist:
 def print_help():
     print(Fore.CYAN + """
 ╔══════════════════════════════════════════════════════════════════════════╗
-║  STOCK TICKER v9.6.0 — HELP & MANUAL                                     ║
+║  STOCK TICKER v10.1.0 — HELP & MANUAL                                    ║
 ╠══════════════════════════════════════════════════════════════════════════╣
-║  COMMANDS:                                                               ║
-║  pf            View full portfolio. Shows P&L, Strategy, and Greeks.     ║
-║  import FILE   Load a CSV file (Fidelity, Schwab, E*Trade supported).    ║
-║  summary       Quick portfolio total value and day change overview.      ║
-║  q SYMBOL      Get a live quote for a stock (e.g., 'q AAPL').            ║
-║  ta SYMBOL     Full technical analysis (RSI, MACD, Bollinger, etc).      ║
-║  compare A B   Compare two stocks side-by-side (e.g., 'compare AAPL MSFT')║
-║  risk          Calculate Portfolio Beta (volatility vs S&P 500).         ║
-║  cal           Scan portfolio for upcoming earnings and dividends.       ║
-║  watch         View watchlist. Usage: 'watch add AAPL' or 'watch rm'.    ║
-║  clear         Delete all current portfolio data (reset).                ║
-║  refresh       Clear cached price data to force fresh updates.           ║
-║  debug         Toggle debug mode for troubleshooting.                    ║
+║  SMART CONTEXT: Commands remember last symbol. Just type 'ta' again!     ║
+║                                                                          ║
+║  PORTFOLIO COMMANDS:                                                     ║
+║  pf              View full portfolio with P&L, Strategy, and Greeks      ║
+║  import FILE     Load CSV (Fidelity, Schwab, E*Trade, Robinhood)         ║
+║  risk            Calculate Portfolio Beta (volatility vs S&P 500)        ║
+║  cal             Scan portfolio for upcoming earnings                    ║
+║  clear           Delete all portfolio data (reset)                       ║
+║                                                                          ║
+║  QUOTE & LOOKUP:                                                         ║
+║  AAPL            Just type ticker for quick quote (sets context)         ║
+║  q SYMBOL        Quick quote (e.g., 'q AAPL')                            ║
+║  quote SYMBOL    Detailed stock quote with fundamentals                  ║
+║  info SYMBOL     Full company info and metrics                           ║
+║  dash SYMBOL     Dashboard: price, trend, and headlines                  ║
+║  news SYMBOL     Latest news headlines for a stock                       ║
+║                                                                          ║
+║  TECHNICAL ANALYSIS:                                                     ║
+║  ta SYMBOL       Basic TA (RSI, MACD, Bollinger, Supertrend)             ║
+║  ta2 SYMBOL      Extended TA (Stochastic, ADX, Ichimoku, Williams %R)    ║
+║  trend SYMBOL    Trend strength analysis with scoring                    ║
+║  levels SYMBOL   Support/Resistance and Fibonacci levels                 ║
+║  compare A B     Compare two stocks side-by-side                         ║
+║                                                                          ║
+║  WATCHLIST:                                                              ║
+║  watch           View watchlist                                          ║
+║  watch add SYM   Add symbol to watchlist                                 ║
+║  watch rm SYM    Remove symbol from watchlist                            ║
+║                                                                          ║
+║  SETTINGS:                                                               ║
+║  refresh         Clear cached data for fresh updates                     ║
+║  debug           Toggle debug mode                                       ║
 ║                                                                          ║
 ║  STRATEGY LEGEND:                                                        ║
-║  Long          You BOUGHT this option (Positive Qty). Asset.             ║
-║  CSP           Cash Secured Put (Short Put). Liability.                  ║
-║  CC            Covered Call (Short Call backed by 100 shares).           ║
-║  PMCC          Poor Man's Covered Call (Short Call backed by Long Call). ║
-║  Naked         Short Call with no underlying stock or long call coverage.║
-║                                                                          ║
-║  COLUMNS:                                                                ║
-║  Intr/Extr     Intrinsic Value vs Extrinsic Value (Time Value).          ║
-║  Net Liq       Total Liquidation Value (Assets - Liabilities + Cash).    ║
+║  Long  = Bought option     CSP  = Cash Secured Put (short put)           ║
+║  CC    = Covered Call      PMCC = Poor Man's Covered Call                ║
+║  Naked = Uncovered short call                                            ║
 ╚══════════════════════════════════════════════════════════════════════════╝
 """ + Style.RESET_ALL)
 
 # --- MAIN ---
 def main():
-    print(Fore.CYAN + Style.BRIGHT + "\n    STOCK TICKER v9.6.0 — Universal\n" + Style.RESET_ALL)
+    print(Fore.CYAN + Style.BRIGHT + "\n    STOCK TICKER v10.1.0 — Universal + Smart Context\n" + Style.RESET_ALL)
     fetcher, pf, wl = PriceFetcher(), Portfolio(), Watchlist()
+    last_symbol = None  # Context memory
     
     while True:
         try:
-            raw = input(Fore.GREEN + "▶ " + Style.RESET_ALL).strip()
+            # Smart prompt showing active context if available
+            prompt_sym = f"[{last_symbol}] " if last_symbol else ""
+            raw = input(Fore.GREEN + f"▶ {prompt_sym}" + Style.RESET_ALL).strip()
             if not raw: continue
-            parts = shlex.split(raw)
-            cmd, args = parts[0].lower(), parts[1:]
             
+            parts = shlex.split(raw)
+            cmd = parts[0].lower()
+            args = parts[1:]
+            
+            # --- CONTEXT HANDLING ---
+            # If command requires a symbol but none provided, use last_symbol
+            symbol_commands = ('quote', 'q', 'ta', 'ta2', 'trend', 'levels', 'info', 'news', 'dash')
+            
+            if cmd in symbol_commands:
+                if args:
+                    last_symbol = args[0].upper()  # Update context
+                elif last_symbol:
+                    args = [last_symbol]  # Inject context
+                    print(Fore.YELLOW + f"  Using active ticker: {last_symbol}" + Style.RESET_ALL)
+                else:
+                    err(f"Usage: {cmd} <symbol>"); continue
+            
+            # --- COMMANDS ---
             if cmd in ('quit', 'exit'): break
             elif cmd == 'import': pf.import_csv(args[0]) if args else err("Usage: import <file>")
             elif cmd in ('pf', 'portfolio'): pf.display(fetcher)
@@ -986,6 +1202,66 @@ def main():
             elif cmd == 'debug': config.debug = not config.debug; print(f"Debug: {config.debug}")
             elif cmd == 'refresh': fetcher.clear_cache(); success("Cache cleared")
             elif cmd in ('help', 'h', '?'): print_help()
+            
+            # --- NEWS COMMAND ---
+            elif cmd == 'news' and args:
+                symbol = args[0].upper()
+                print(Fore.CYAN + f"\n{'═'*70}\n NEWS — {symbol}\n{'═'*70}" + Style.RESET_ALL)
+                news_items = fetcher.get_news(symbol)
+                if not news_items: warn("No recent news found.")
+                else:
+                    for i, item in enumerate(news_items[:5]):
+                        pub = datetime.fromtimestamp(item.get('providerPublishTime', 0)).strftime('%Y-%m-%d %H:%M')
+                        print(f"\n  {Style.BRIGHT}{item.get('title')}{Style.RESET_ALL}")
+                        print(f"  {Fore.CYAN}{item.get('publisher')}{Style.RESET_ALL} • {pub}")
+                        if item.get('link'): print(f"  {item.get('link')}")
+                print(f"{'═'*70}\n")
+
+            # --- DASHBOARD COMMAND ---
+            elif cmd == 'dash' and args:
+                symbol = args[0].upper()
+                print(Fore.CYAN + f"\n{'═'*70}\n DASHBOARD — {symbol}\n{'═'*70}" + Style.RESET_ALL)
+                
+                # Parallel fetch for dashboard components
+                with ThreadPoolExecutor() as executor:
+                    f_price = executor.submit(fetcher.get_stock_price, symbol)
+                    f_hist = executor.submit(fetcher.get_history, symbol, "6mo")
+                    f_meta = executor.submit(fetcher.get_meta, symbol)
+                    f_news = executor.submit(fetcher.get_news, symbol)
+                    
+                    d = f_price.result()
+                    df = f_hist.result()
+                    meta = f_meta.result()
+                    news = f_news.result()
+
+                # 1. Price Header
+                print(f"\n{Style.BRIGHT}{meta.get('name', symbol)}{Style.RESET_ALL} ({meta.get('sector', 'Unknown')})")
+                print(f"  {Style.BRIGHT}PRICE:{Style.RESET_ALL}   {fmt_money(d['price'])}  {color_money(d['change'])} ({color_pct(d['pct'])})")
+                
+                # 2. Trend Snapshot
+                if df is not None and len(df) > 30:
+                    trend = TechnicalAnalysis.trend_strength(df)
+                    rsi = TechnicalAnalysis.rsi(df['Close']).iloc[-1]
+                    print(f"  {Style.BRIGHT}TREND:{Style.RESET_ALL}   {color_signal(trend['strength'])} (Score: {trend['score']})")
+                    print(f"  {Style.BRIGHT}RSI:{Style.RESET_ALL}     {rsi:.1f} ({color_signal('OVERSOLD' if rsi<30 else 'OVERBOUGHT' if rsi>70 else 'Neutral')})")
+                    
+                    # Mini Sparkline (Text based)
+                    closes = df['Close'].tail(10).tolist()
+                    min_c, max_c = min(closes), max(closes)
+                    spark = ""
+                    if max_c > min_c:
+                        chars = "  ▂▃▄▅▆▇█"
+                        spark = "".join([chars[int((c - min_c) / (max_c - min_c) * 8)] for c in closes])
+                    print(f"  {Style.BRIGHT}10D:{Style.RESET_ALL}     {spark}  {fmt_money(closes[0])} -> {fmt_money(closes[-1])}")
+
+                # 3. Recent Headlines
+                if news:
+                    print(f"\n{Style.BRIGHT}LATEST HEADLINES{Style.RESET_ALL}")
+                    for item in news[:3]:
+                        title = item.get('title', '')[:60]
+                        print(f"  • {title}...")
+                print(f"{'═'*70}\n")
+
             elif cmd == 'ta' and args:
                 # Technical Analysis command: ta SYMBOL
                 symbol = args[0].upper()
@@ -1165,15 +1441,118 @@ def main():
                     print(tabulate(rows, headers=["Metric", sym1, "", sym2], tablefmt="simple"))
                     print(f"{'═'*80}\n")
             
+            # Extended Technical Analysis
+            elif cmd == 'ta2' and args:
+                symbol = args[0].upper()
+                df = fetcher.get_history(symbol, "1y")
+                if df is None or len(df) < 50: err(f"Insufficient data for {symbol}")
+                else:
+                    close, price = df['Close'], df['Close'].iloc[-1]
+                    d = fetcher.get_stock_price(symbol)
+                    print(Fore.CYAN + f"\n{'═'*70}\n EXTENDED TA — {symbol}\n{'═'*70}" + Style.RESET_ALL)
+                    print(f"\n{Style.BRIGHT}PRICE{Style.RESET_ALL}: {fmt_money(price)} ({color_pct(d['pct'])})")
+                    stoch_k, stoch_d = TechnicalAnalysis.stochastic(df)
+                    k_val = stoch_k.iloc[-1]
+                    print(f"\n{Style.BRIGHT}STOCHASTIC{Style.RESET_ALL}: %K={k_val:.1f} %D={stoch_d.iloc[-1]:.1f} -> {color_signal('OVERSOLD' if k_val < 20 else 'OVERBOUGHT' if k_val > 80 else 'Neutral')}")
+                    adx, plus_di, minus_di = TechnicalAnalysis.adx(df)
+                    adx_val = adx.iloc[-1] if not pd.isna(adx.iloc[-1]) else 0
+                    print(f"{Style.BRIGHT}ADX{Style.RESET_ALL}: {adx_val:.1f} +DI={plus_di.iloc[-1]:.1f} -DI={minus_di.iloc[-1]:.1f} -> {color_signal('BULLISH' if plus_di.iloc[-1] > minus_di.iloc[-1] else 'BEARISH')}")
+                    wr = TechnicalAnalysis.williams_r(df).iloc[-1]
+                    print(f"{Style.BRIGHT}WILLIAMS %R{Style.RESET_ALL}: {wr:.1f} -> {color_signal('OVERSOLD' if wr < -80 else 'OVERBOUGHT' if wr > -20 else 'Neutral')}")
+                    cci = TechnicalAnalysis.cci(df).iloc[-1]
+                    print(f"{Style.BRIGHT}CCI{Style.RESET_ALL}: {cci:.1f} -> {color_signal('OVERSOLD' if cci < -100 else 'OVERBOUGHT' if cci > 100 else 'Neutral')}")
+                    mfi = TechnicalAnalysis.mfi(df).iloc[-1]
+                    print(f"{Style.BRIGHT}MFI{Style.RESET_ALL}: {mfi:.1f} -> {color_signal('OVERSOLD' if mfi < 20 else 'OVERBOUGHT' if mfi > 80 else 'Neutral')}")
+                    vwap = TechnicalAnalysis.vwap(df).iloc[-1]
+                    print(f"{Style.BRIGHT}VWAP{Style.RESET_ALL}: {fmt_money(vwap)} -> {color_signal('BULLISH' if price > vwap else 'BEARISH')}")
+                    ich = TechnicalAnalysis.ichimoku(df)
+                    print(f"{Style.BRIGHT}ICHIMOKU{Style.RESET_ALL}: Tenkan={fmt_money(ich['tenkan_sen'].iloc[-1])} Kijun={fmt_money(ich['kijun_sen'].iloc[-1])} -> {color_signal('BULLISH' if ich['tenkan_sen'].iloc[-1] > ich['kijun_sen'].iloc[-1] else 'BEARISH')}")
+                    obv = TechnicalAnalysis.obv(df)
+                    print(f"{Style.BRIGHT}OBV{Style.RESET_ALL}: {color_signal('BULLISH' if obv.iloc[-1] > obv.rolling(20).mean().iloc[-1] else 'BEARISH')}")
+                    print(f"{'═'*70}\n")
+            
+            # Trend Analysis
+            elif cmd == 'trend' and args:
+                symbol = args[0].upper()
+                df = fetcher.get_history(symbol, "1y")
+                if df is None or len(df) < 50: err(f"Insufficient data for {symbol}")
+                else:
+                    close, price = df['Close'], df['Close'].iloc[-1]
+                    d = fetcher.get_stock_price(symbol)
+                    print(Fore.CYAN + f"\n{'═'*70}\n TREND — {symbol}\n{'═'*70}" + Style.RESET_ALL)
+                    print(f"\n{Style.BRIGHT}CURRENT{Style.RESET_ALL}: {fmt_money(price)} ({color_pct(d['pct'])})")
+                    trend = TechnicalAnalysis.trend_strength(df)
+                    print(f"\n{Style.BRIGHT}TREND STRENGTH{Style.RESET_ALL}")
+                    print(f"  Score: {trend['score']}/9  Strength: {color_signal(trend['strength'])}  ADX: {trend['adx']:.1f}")
+                    sma_20, sma_50 = close.rolling(20).mean().iloc[-1], close.rolling(50).mean().iloc[-1]
+                    print(f"\n{Style.BRIGHT}PERFORMANCE{Style.RESET_ALL}")
+                    for label, days in [('1 Week', 5), ('1 Month', 21), ('3 Months', 63)]:
+                        if len(close) > days: print(f"  {label}: {color_pct((price - close.iloc[-days]) / close.iloc[-days] * 100)}")
+                    print(f"{'═'*70}\n")
+            
+            # Support/Resistance Levels
+            elif cmd == 'levels' and args:
+                symbol = args[0].upper()
+                df = fetcher.get_history(symbol, "6mo")
+                if df is None or len(df) < 50: err(f"Insufficient data for {symbol}")
+                else:
+                    price = df['Close'].iloc[-1]
+                    d = fetcher.get_stock_price(symbol)
+                    print(Fore.CYAN + f"\n{'═'*70}\n LEVELS — {symbol}\n{'═'*70}" + Style.RESET_ALL)
+                    print(f"\n{Style.BRIGHT}CURRENT{Style.RESET_ALL}: {fmt_money(price)} ({color_pct(d['pct'])})")
+                    fib = TechnicalAnalysis.fibonacci_retracement(df)
+                    print(f"\n{Style.BRIGHT}FIBONACCI{Style.RESET_ALL}")
+                    for lvl, val in fib.items():
+                        ind = " <--" if abs(price - val) / price < 0.01 else ""
+                        print(f"  {lvl:<15} {fmt_money(val)}{ind}")
+                    pivots = TechnicalAnalysis.pivot_points(df)
+                    print(f"\n{Style.BRIGHT}PIVOTS{Style.RESET_ALL}")
+                    print(f"  R3: {fmt_money(pivots['R3'])}  R2: {fmt_money(pivots['R2'])}  R1: {fmt_money(pivots['R1'])}")
+                    print(f"  Pivot: {fmt_money(pivots['P'])}")
+                    print(f"  S1: {fmt_money(pivots['S1'])}  S2: {fmt_money(pivots['S2'])}  S3: {fmt_money(pivots['S3'])}")
+                    sr = TechnicalAnalysis.support_resistance(df)
+                    print(f"\n{Style.BRIGHT}SUPPORT/RESISTANCE{Style.RESET_ALL}")
+                    for i, r in enumerate(sr['resistance'][:3], 1): print(f"  R{i}: {fmt_money(r)}")
+                    for i, s in enumerate(sr['support'][:3], 1): print(f"  S{i}: {fmt_money(s)}")
+                    print(f"{'═'*70}\n")
+            
+            # Detailed Quote
+            elif cmd in ('quote', 'info') and args:
+                symbol = args[0].upper()
+                d = fetcher.get_stock_price(symbol)
+                meta = fetcher.get_meta(symbol)
+                print(Fore.CYAN + f"\n{'═'*70}\n QUOTE — {symbol}\n{'═'*70}" + Style.RESET_ALL)
+                print(f"\n{Style.BRIGHT}{meta.get('name', symbol)}{Style.RESET_ALL}")
+                print(f"  Sector: {meta.get('sector', 'N/A')}  Industry: {meta.get('industry', 'N/A')}")
+                print(f"\n{Style.BRIGHT}PRICE{Style.RESET_ALL}")
+                print(f"  Current: {fmt_money(d['price'])}  Change: {color_money(d['change'])} ({color_pct(d['pct'])})")
+                h52, l52 = meta.get('52w_high', 0), meta.get('52w_low', 0)
+                if h52 and l52:
+                    print(f"\n{Style.BRIGHT}52 WEEK{Style.RESET_ALL}")
+                    print(f"  High: {fmt_money(h52)}  Low: {fmt_money(l52)}  Position: {(d['price'] - l52) / (h52 - l52) * 100:.0f}%")
+                print(f"\n{Style.BRIGHT}FUNDAMENTALS{Style.RESET_ALL}")
+                mc = meta.get('market_cap', 0)
+                if mc: print(f"  Market Cap: ${mc/1e9:.2f}B" if mc >= 1e9 else f"  Market Cap: ${mc/1e6:.2f}M")
+                if meta.get('pe_ratio'): print(f"  P/E: {meta['pe_ratio']:.2f}")
+                if meta.get('eps'): print(f"  EPS: {fmt_money(meta['eps'])}")
+                if meta.get('dividend_yield'): print(f"  Div Yield: {meta['dividend_yield']*100:.2f}%")
+                if meta.get('beta'): print(f"  Beta: {meta['beta']:.2f}")
+                if meta.get('target_price'):
+                    print(f"\n{Style.BRIGHT}ANALYST{Style.RESET_ALL}")
+                    print(f"  Target: {fmt_money(meta['target_price'])}  Upside: {color_pct((meta['target_price'] - d['price']) / d['price'] * 100)}")
+                print(f"{'═'*70}\n")
+            
             elif cmd == 'q' and args:
                 # Quote command: q SYMBOL
                 symbol = args[0].upper()
                 d = fetcher.get_stock_price(symbol)
                 print(f"  {symbol}: {fmt_money(d['price'])} ({color_pct(d['pct'])})")
-            elif len(cmd) <= 5: 
+                last_symbol = symbol  # Update context
+            elif len(cmd) <= 5 and cmd.isalpha(): 
                 # Direct ticker lookup (e.g., typing "AAPL" directly)
                 d = fetcher.get_stock_price(cmd)
                 print(f"  {cmd.upper()}: {fmt_money(d['price'])} ({color_pct(d['pct'])})")
+                last_symbol = cmd.upper()  # Update context
         except Exception as e: err(str(e))
 
 if __name__ == "__main__":
