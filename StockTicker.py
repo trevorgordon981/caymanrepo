@@ -257,19 +257,45 @@ class PriceFetcher:
         result = {'price': 0, 'prev': 0, 'change': 0, 'pct': 0, 'source': 'none'}
         try:
             t = yf.Ticker(symbol)
+            # Method 1: fast_info (fastest)
             if t.fast_info and t.fast_info.last_price:
                 price, prev = t.fast_info.last_price, t.fast_info.previous_close
-                result = {'price': price, 'prev': prev, 'source': 'yfinance_fast', 'change': price - prev, 'pct': (price - prev) / prev * 100}
-            else:
+                result = {'price': price, 'prev': prev, 'source': 'yfinance_fast', 'change': price - prev, 'pct': (price - prev) / prev * 100 if prev else 0}
+            
+            # Method 2: info dict
+            if result['price'] == 0:
+                try:
+                    info = t.info
+                    price = info.get('regularMarketPrice') or info.get('currentPrice') or info.get('navPrice', 0)
+                    prev = info.get('regularMarketPreviousClose') or info.get('previousClose', 0)
+                    if price:
+                        result = {'price': float(price), 'prev': float(prev) if prev else float(price), 'source': 'yfinance_info', 'change': 0, 'pct': 0}
+                        result['change'] = result['price'] - result['prev']
+                        result['pct'] = (result['change']/result['prev']*100) if result['prev'] else 0
+                except: pass
+            
+            # Method 3: history (most reliable fallback)
+            if result['price'] == 0:
+                try:
+                    hist = t.history(period='5d')
+                    if not hist.empty:
+                        price = float(hist['Close'].iloc[-1])
+                        prev = float(hist['Close'].iloc[-2]) if len(hist) > 1 else price
+                        result = {'price': price, 'prev': prev, 'source': 'yfinance_history', 'change': price - prev, 'pct': (price - prev) / prev * 100 if prev else 0}
+                except: pass
+            
+            # Method 4: Direct Yahoo API
+            if result['price'] == 0:
                 resp = requests.get(f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}", headers={'User-Agent': 'Mozilla/5.0'}, timeout=5)
                 if resp.status_code == 200:
                     meta = resp.json().get('chart', {}).get('result', [{}])[0].get('meta', {})
                     price = meta.get('regularMarketPrice', 0)
                     prev = meta.get('previousClose', 0)
                     if price:
-                        result = {'price': float(price), 'prev': float(prev) if prev else float(price), 'source': 'yahoo_live', 'change': float(price)-float(prev), 'pct': 0}
+                        result = {'price': float(price), 'prev': float(prev) if prev else float(price), 'source': 'yahoo_api', 'change': float(price)-float(prev), 'pct': 0}
                         result['pct'] = (result['change']/result['prev']*100) if result['prev'] else 0
-        except Exception: pass
+        except Exception as e:
+            if config.debug: print(f"Debug: {symbol} fetch error: {e}")
         if result['price'] > 0: self.stock_cache[symbol] = {'time': _now(), 'data': result}
         return result
 
@@ -708,16 +734,16 @@ class Portfolio:
                     val = qty * price
                     pnl = val - cost
                     day = val * (day_pct/100)
-                    p_str, d_str = fmt_money(price), color_pct(day_pct)
+                    d_str = color_pct(day_pct)
                 else:
                     val = pos.get('fidelity_value', 0)
                     pnl = pos.get('fidelity_pnl', 0)
                     day = pos.get('day_pnl', 0)
-                    p_str, d_str = f"~{fmt_money(pos.get('fidelity_price',0))}", "-"
+                    d_str = "-"
                 
                 total_val += val; total_cost += cost; total_pnl += pnl; total_day += day
-                rows.append([sym, f"{qty:.2f}", fmt_money(pos.get('avg',0)), p_str, d_str, fmt_money(val), color_pnl(pnl, (pnl/cost*100) if cost else 0)])
-            print(tabulate(rows, headers=["Symbol", "Qty", "Avg", "Price", "Day%", "Value", "P&L"]))
+                rows.append([sym, f"{qty:.2f}", fmt_money(pos.get('avg',0)), fmt_money(cost), d_str, fmt_money(val), color_pnl(pnl, (pnl/cost*100) if cost else 0)])
+            print(tabulate(rows, headers=["Symbol", "Qty", "Avg", "Cost", "Day%", "Value", "P&L"]))
 
         # --- OPTIONS ---
         # Map Long Calls for PMCC (Qty > 0)
@@ -779,14 +805,11 @@ class Portfolio:
                 else: total_day += o.get('day_pnl', 0)
                 
                 desc = f"{o['symbol']} {o['expiration'][5:]} ${o['strike']:.0f}{o['type'][0].upper()}"
-                p_str = f"${price:.2f}"
-                if opt_live['bid']>0 and opt_live['ask']>0 and (opt_live['ask']-opt_live['bid']) > 0.5:
-                     p_str += Fore.RED + "⚠" + Style.RESET_ALL
                 
-                rows.append([desc, strat, f"{qty:.0f}", p_str, f"{days}d", f"I:{intr:.1f}/E:{extr:.1f}", fmt_money(val), color_pnl(pnl, (pnl/cost*100) if cost else 0)])
+                rows.append([desc, strat, f"{qty:.0f}", fmt_money(cost), f"{days}d", f"I:{intr:.1f}/E:{extr:.1f}", fmt_money(val), color_pnl(pnl, (pnl/cost*100) if cost else 0)])
             
             prog.done()
-            print(tabulate(rows, headers=["Option", "Strat", "Qty", "Price", "DTE", "Intr/Extr", "Value", "P&L"]))
+            print(tabulate(rows, headers=["Option", "Strat", "Qty", "Cost", "DTE", "Intr/Extr", "Value", "P&L"]))
 
         print(f"\n{'═'*95}")
         print(f"  {Style.BRIGHT}NET LIQ:{Style.RESET_ALL}      {fmt_money(total_val + cash)}")
@@ -899,7 +922,13 @@ def main():
             elif cmd == 'debug': config.debug = not config.debug; print(f"Debug: {config.debug}")
             elif cmd == 'refresh': fetcher.clear_cache(); success("Cache cleared")
             elif cmd in ('help', 'h', '?'): print_help()
+            elif cmd == 'q' and args:
+                # Quote command: q SYMBOL
+                symbol = args[0].upper()
+                d = fetcher.get_stock_price(symbol)
+                print(f"  {symbol}: {fmt_money(d['price'])} ({color_pct(d['pct'])})")
             elif len(cmd) <= 5: 
+                # Direct ticker lookup (e.g., typing "AAPL" directly)
                 d = fetcher.get_stock_price(cmd)
                 print(f"  {cmd.upper()}: {fmt_money(d['price'])} ({color_pct(d['pct'])})")
         except Exception as e: err(str(e))
