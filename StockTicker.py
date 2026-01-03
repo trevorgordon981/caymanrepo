@@ -1,9 +1,41 @@
 #!/usr/bin/env python3
 """
-STOCK TICKER APP v11.0.0 — Universal Portfolio Tracker & Analyzer
+STOCK TICKER APP v12.2.0 — Universal Portfolio Tracker & Analyzer
 INSTALL: pip install yfinance pandas numpy matplotlib tabulate colorama requests scipy
 
-NEW IN v11.0.0:
+NEW IN v12.2.0 (LEAPS FOCUS):
+- 📊 LEAPS Dashboard (leaps): Dedicated view for long-term options
+- 🔄 Roll Optimizer (leapsroll): Analyze roll strategies with cost/theta analysis
+- 🔍 LEAPS Chain Finder (leapschain): Find stock replacement opportunities
+- 📐 Portfolio Greeks (greeks): Full delta/gamma/theta/vega exposure analysis
+- 🏥 LEAPS Health Scoring: Automatic assessment of position health
+- ⚡ Roll Recommendations: Alerts when positions need attention
+- 📈 Breakeven Tracking: See your profit thresholds at a glance
+
+NEW IN v12.1.0 (UX IMPROVEMENTS):
+- 🎨 Cleaner visual design with improved spacing and headers
+- 💡 Smart command suggestions for typos ("Did you mean...?")
+- 📋 Quick-start guide shown on first launch
+- ⌨️  More command shortcuts (p=portfolio, m=market, t=ta, d=dash)
+- 🔔 Contextual tips to guide you to related commands
+- 📊 Portfolio value shown in prompt after import
+- 🎯 Improved error messages with helpful hints
+- ⏳ Better progress bars with time estimates
+- 📖 Searchable help (help portfolio, help analysis)
+- 🎪 Cleaner tables and section headers
+
+PREVIOUS (v12.0.0):
+- 📄 Export Reports (export): Generate PDF/CSV portfolio reports
+- 📐 Position Sizing (size): Kelly criterion & risk-based position calculator
+- 🔗 Correlation Matrix (corr): Portfolio diversification analysis
+- 🎯 Stop-Loss Tracker (stops): Manage stop-loss and take-profit levels
+- 📈 Performance History (perf): Track portfolio performance over time
+- ⏱️ Multi-Timeframe TA (mtf): Analyze across multiple timeframes
+- 🔄 Rebalance Suggestions (rebalance): Get portfolio allocation advice
+- 🛡️ Improved reliability: Retry logic, rate limiting, validation
+- 💾 Data persistence: Historical snapshots saved automatically
+
+PREVIOUS (v11.0.0):
 - 🚨 Price Alerts (alert): Set price targets with notifications
 - 📊 Sector Heatmap (sectors): Visual sector performance breakdown
 - 🎯 AI Trade Signals (signals): Aggregated buy/sell scoring system
@@ -23,12 +55,15 @@ PREVIOUS (v10.2.0):
 - Smart Context: Commands remember the last used symbol
 """
 from __future__ import annotations
-import os, re, sys, json, time, math, shlex, logging, warnings, random
+import os, re, sys, json, time, math, shlex, logging, warnings, random, hashlib, atexit
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple, Callable
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from functools import wraps
+from collections import defaultdict
+import threading
 
 warnings.filterwarnings("ignore")
 import pandas as pd
@@ -135,6 +170,499 @@ SECTOR_ETFS = {
 def _now(): return time.time()
 def today_str(): return datetime.now().strftime("%Y-%m-%d")
 
+# --- RATE LIMITER ---
+class RateLimiter:
+    """Thread-safe rate limiter for API calls"""
+    def __init__(self, calls_per_second: float = 2.0, burst: int = 5):
+        self.calls_per_second = calls_per_second
+        self.burst = burst
+        self.tokens = burst
+        self.last_update = _now()
+        self.lock = threading.Lock()
+    
+    def acquire(self, timeout: float = 30.0) -> bool:
+        """Acquire a token, blocking if necessary. Returns True if acquired."""
+        deadline = _now() + timeout
+        while _now() < deadline:
+            with self.lock:
+                now = _now()
+                # Add tokens based on time elapsed
+                elapsed = now - self.last_update
+                self.tokens = min(self.burst, self.tokens + elapsed * self.calls_per_second)
+                self.last_update = now
+                
+                if self.tokens >= 1:
+                    self.tokens -= 1
+import difflib
+
+warnings.filterwarnings("ignore")
+import pandas as pd
+import numpy as np
+import requests
+
+# Set Logging Levels
+logging.getLogger("yfinance").setLevel(logging.CRITICAL)
+logging.getLogger("urllib3").setLevel(logging.CRITICAL)
+logging.getLogger("requests").setLevel(logging.CRITICAL)
+import yfinance as yf
+
+# --- OPTIONAL IMPORTS ---
+try:
+    from scipy.stats import norm, linregress
+    HAS_SCIPY = True
+except ImportError:
+    HAS_SCIPY = False
+
+try:
+    import matplotlib.pyplot as plt
+    HAS_MATPLOTLIB = True
+except:
+    HAS_MATPLOTLIB = False
+
+try:
+    from tabulate import tabulate
+except ImportError:
+    def tabulate(data, headers=None, tablefmt="simple"):
+        if not data: return ""
+        lines = []
+        if headers:
+            lines.append(" | ".join(str(h) for h in headers))
+            lines.append("-" * 80)
+        for row in data:
+            lines.append(" | ".join(str(c) for c in row))
+        return "\n".join(lines)
+
+try:
+    from colorama import init as _ci, Fore, Style
+    _ci(autoreset=True)
+except ImportError:
+    class Fore:
+        GREEN = RED = YELLOW = MAGENTA = CYAN = WHITE = BLUE = RESET = ""
+    class Style:
+        RESET_ALL = BRIGHT = ""
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# NEW v12.1: ENHANCED UX COMPONENTS
+# ═══════════════════════════════════════════════════════════════════════════════
+
+# All available commands with descriptions for smart suggestions
+ALL_COMMANDS = {
+    'pf': 'View portfolio', 'portfolio': 'View portfolio', 'import': 'Import CSV',
+    'risk': 'Risk analysis', 'cal': 'Earnings calendar', 'divs': 'Dividends',
+    'stats': 'Quick stats', 'clear': 'Clear portfolio', 'export': 'Export report',
+    'stops': 'Stop-loss tracker', 'size': 'Position sizing', 'perf': 'Performance',
+    'corr': 'Correlation', 'rebalance': 'Rebalancing', 'mtf': 'Multi-timeframe',
+    'q': 'Quick quote', 'quote': 'Detailed quote', 'info': 'Company info',
+    'dash': 'Dashboard', 'news': 'News', 'chart': 'ASCII chart',
+    'market': 'Market overview', 'sectors': 'Sector heatmap', 'movers': 'Top movers',
+    'random': 'Random stock', 'ta': 'Technical analysis', 'ta2': 'Extended TA',
+    'trend': 'Trend analysis', 'levels': 'Support/resistance', 'signals': 'Trade signals',
+    'sentiment': 'News sentiment', 'compare': 'Compare stocks', 'backtest': 'Backtest',
+    'watch': 'Watchlist', 'scan': 'Scan watchlist', 'alert': 'Price alerts',
+    'refresh': 'Clear cache', 'debug': 'Toggle debug', 'help': 'Show help',
+    'h': 'Show help', '?': 'Show help', 'quit': 'Exit', 'exit': 'Exit',
+    # LEAPS Commands (NEW)
+    'leaps': 'LEAPS portfolio dashboard', 'leapsroll': 'LEAPS roll optimizer',
+    'leapschain': 'Find LEAPS opportunities', 'greeks': 'Portfolio Greeks exposure',
+}
+
+# Command shortcuts for faster typing
+COMMAND_ALIASES = {
+    'p': 'pf', 'port': 'pf', 'i': 'import', 'load': 'import',
+    's': 'stats', 'summary': 'stats', 'm': 'market', 'mkt': 'market',
+    'sec': 'sectors', 'heat': 'sectors', 'w': 'watch', 'wl': 'watch',
+    'a': 'alert', 'alerts': 'alert', 'n': 'news', 'd': 'dash',
+    'dashboard': 'dash', 'c': 'chart', 'l': 'levels', 't': 'ta',
+    'tech': 'ta', 'sig': 'signals', 'sent': 'sentiment',
+    'comp': 'compare', 'vs': 'compare', 'bt': 'backtest',
+    'r': 'random', 'discover': 'random', 'x': 'export',
+    'st': 'stops', 'stop': 'stops', 'sz': 'size', 'rb': 'rebalance',
+    'bye': 'quit', 'q!': 'quit',
+    # LEAPS aliases (NEW)
+    'leap': 'leaps', 'lp': 'leaps', 'roll': 'leapsroll', 'lr': 'leapsroll',
+    'chain': 'leapschain', 'lc': 'leapschain', 'gr': 'greeks', 'g': 'greeks',
+}
+
+def suggest_command(user_input: str):
+    """Find the closest matching command for typo correction."""
+    user_cmd = user_input.lower().split()[0] if user_input else ""
+    if not user_cmd or user_cmd in ALL_COMMANDS or user_cmd in COMMAND_ALIASES:
+        return None
+    all_cmds = list(ALL_COMMANDS.keys()) + list(COMMAND_ALIASES.keys())
+    matches = difflib.get_close_matches(user_cmd, all_cmds, n=1, cutoff=0.6)
+    return matches[0] if matches else None
+
+def print_welcome():
+    """Print a welcoming startup screen."""
+    print(Fore.CYAN + Style.BRIGHT + """
+    ╔═══════════════════════════════════════════════════════════════════════╗
+    ║                                                                       ║
+    ║   ███████╗████████╗ ██████╗  ██████╗██╗  ██╗                          ║
+    ║   ██╔════╝╚══██╔══╝██╔═══██╗██╔════╝██║ ██╔╝                          ║
+    ║   ███████╗   ██║   ██║   ██║██║     █████╔╝                           ║
+    ║   ╚════██║   ██║   ██║   ██║██║     ██╔═██╗                           ║
+    ║   ███████║   ██║   ╚██████╔╝╚██████╗██║  ██╗                          ║
+    ║   ╚══════╝   ╚═╝    ╚═════╝  ╚═════╝╚═╝  ╚═╝  TICKER v12.1           ║
+    ║                                                                       ║
+    ╚═══════════════════════════════════════════════════════════════════════╝
+    """ + Style.RESET_ALL)
+
+def print_quick_start():
+    """Print quick-start tips for new users."""
+    print(Fore.WHITE + """
+    ┌─────────────────────────────────────────────────────────────────────┐
+    │  """ + Style.BRIGHT + """⚡ QUICK START""" + Style.RESET_ALL + Fore.WHITE + """                                                      │
+    ├─────────────────────────────────────────────────────────────────────┤
+    │                                                                     │
+    │  """ + Fore.GREEN + """AAPL""" + Fore.WHITE + """          → Quick quote (just type any ticker)             │
+    │  """ + Fore.GREEN + """market""" + Fore.WHITE + """        → See indices, VIX & Bitcoin                     │
+    │  """ + Fore.GREEN + """import file""" + Fore.WHITE + """   → Load your portfolio CSV                        │
+    │  """ + Fore.GREEN + """ta AAPL""" + Fore.WHITE + """       → Technical analysis                             │
+    │  """ + Fore.GREEN + """help""" + Fore.WHITE + """          → Full command list                              │
+    │                                                                     │
+    │  """ + Fore.YELLOW + """💡 Tip: Commands remember last symbol. Just type 'ta' again!""" + Fore.WHITE + """     │
+    │  """ + Fore.YELLOW + """💡 Tip: Use shortcuts: p=portfolio, m=market, t=ta, d=dash""" + Fore.WHITE + """      │
+    │                                                                     │
+    └─────────────────────────────────────────────────────────────────────┘
+    """ + Style.RESET_ALL)
+
+def print_tip(tip_type):
+    """Print contextual tips based on what the user just did."""
+    tips = {
+        'import': f"  {Fore.YELLOW}💡 Next: 'pf' for portfolio, 'stats' for summary, 'risk' for beta analysis{Style.RESET_ALL}",
+        'pf': f"  {Fore.YELLOW}💡 Try: 'stats' for summary, 'divs' for dividends, 'corr' for diversification{Style.RESET_ALL}",
+        'ta': f"  {Fore.YELLOW}💡 Try: 'ta2' for more indicators, 'signals' for buy/sell score, 'levels' for S/R{Style.RESET_ALL}",
+        'quote': f"  {Fore.YELLOW}💡 Try: 'dash' for overview, 'news' for headlines, 'chart' for price history{Style.RESET_ALL}",
+        'market': f"  {Fore.YELLOW}💡 Try: 'sectors' for heatmap, 'movers' for top gainers/losers{Style.RESET_ALL}",
+        'watch': f"  {Fore.YELLOW}💡 Try: 'scan' to find oversold/trending stocks in your watchlist{Style.RESET_ALL}",
+        'first_stock': f"  {Fore.YELLOW}💡 Now try: 'ta' for technicals, 'news' for headlines, 'dash' for overview{Style.RESET_ALL}",
+    }
+    if tip_type in tips and config.show_tips:
+        print(tips[tip_type])
+
+def format_prompt(pf_value=0, last_symbol=None):
+    """Create a rich prompt showing portfolio value and context."""
+    parts = []
+    if pf_value > 0:
+        if pf_value >= 1_000_000:
+            val_str = f"${pf_value/1_000_000:.2f}M"
+        elif pf_value >= 1_000:
+            val_str = f"${pf_value/1_000:.1f}K"
+        else:
+            val_str = f"${pf_value:.0f}"
+        parts.append(Fore.GREEN + val_str + Style.RESET_ALL)
+    if last_symbol:
+        parts.append(Fore.CYAN + last_symbol + Style.RESET_ALL)
+    if parts:
+        return f"[{' | '.join(parts)}] " + Fore.GREEN + "▶ " + Style.RESET_ALL
+    return Fore.GREEN + "▶ " + Style.RESET_ALL
+
+def print_header(title, width=70, icon=""):
+    """Print a clean section header."""
+    if icon:
+        title = f"{icon} {title}"
+    print(Fore.CYAN + f"\n{'─'*width}\n {title}\n{'─'*width}" + Style.RESET_ALL)
+
+def print_footer(width=70):
+    """Print a clean section footer."""
+    print(Fore.CYAN + f"{'─'*width}\n" + Style.RESET_ALL)
+
+def print_kv(key, value, indent=2):
+    """Print a formatted key-value pair."""
+    print(f"{' '*indent}{Style.BRIGHT}{key}:{Style.RESET_ALL} {value}")
+
+def print_error(msg, hint=None):
+    """Print an error message with an optional helpful hint."""
+    print(Fore.RED + f"  ✗ {msg}" + Style.RESET_ALL)
+    if hint:
+        print(Fore.YELLOW + f"    💡 {hint}" + Style.RESET_ALL)
+
+def print_searchable_help(keyword=None):
+    """Print help filtered by keyword."""
+    help_sections = {
+        'portfolio': """
+  """ + Style.BRIGHT + """PORTFOLIO COMMANDS""" + Style.RESET_ALL + """
+    pf, p             View full portfolio with P&L and strategy labels
+    import FILE       Load CSV (Fidelity, Schwab, E*Trade, Robinhood, etc.)
+    stats, s          Quick portfolio health stats at a glance
+    risk              Calculate portfolio beta vs S&P 500
+    cal               Scan portfolio for upcoming earnings
+    divs              Show dividend income & upcoming ex-dates
+    export [csv]      Export portfolio report
+    clear             Delete all portfolio data
+""",
+        'leaps': """
+  """ + Style.BRIGHT + """LEAPS OPTIONS (v12.2)""" + Style.RESET_ALL + """
+    leaps, lp         LEAPS portfolio dashboard with health scores
+    leapsroll SYM     Roll optimizer for LEAPS positions
+    leapschain SYM    Find new LEAPS opportunities [--budget AMT]
+    greeks, g         Portfolio-wide Greeks exposure analysis
+    
+  """ + Style.BRIGHT + """LEAPS TIPS""" + Style.RESET_ALL + """
+    • LEAPS = options with >270 days to expiration
+    • Health score considers DTE, moneyness, theta decay
+    • Roll when DTE drops below 180 or if deep OTM
+    • High delta LEAPS (0.70+) work as stock replacement
+""",
+        'risk': """
+  """ + Style.BRIGHT + """RISK MANAGEMENT (v12)""" + Style.RESET_ALL + """
+    stops             View/manage stop-loss and take-profit levels
+    stops add SYM --stop PRICE [--tp PRICE] [--trail PCT]
+    size SYM          Position sizing calculator
+    perf              View portfolio performance history
+    corr              Portfolio correlation matrix
+    rebalance         Get rebalancing suggestions
+    mtf SYMBOL        Multi-timeframe analysis
+""",
+        'quote': """
+  """ + Style.BRIGHT + """QUOTE & LOOKUP""" + Style.RESET_ALL + """
+    AAPL              Just type ticker for quick quote
+    q SYMBOL          Quick quote
+    quote SYMBOL      Detailed quote with fundamentals
+    dash, d SYMBOL    Dashboard: price, trend, headlines
+    news, n SYMBOL    Latest news headlines
+    chart, c SYMBOL   ASCII price chart
+""",
+        'market': """
+  """ + Style.BRIGHT + """MARKET OVERVIEW""" + Style.RESET_ALL + """
+    market, m         Show indices, VIX, and Bitcoin
+    sectors           Sector heatmap - visual performance
+    movers            Top gainers and losers today
+    random, r         Discover a random stock to research
+""",
+        'analysis': """
+  """ + Style.BRIGHT + """TECHNICAL ANALYSIS""" + Style.RESET_ALL + """
+    ta, t SYMBOL      Basic TA (RSI, MACD, Bollinger, Supertrend)
+    ta2 SYMBOL        Extended TA (Stochastic, ADX, Ichimoku)
+    trend SYMBOL      Trend strength analysis
+    levels, l SYMBOL  Support/Resistance and Fibonacci
+    signals SYMBOL    AI trade signal aggregator (buy/sell score)
+    sentiment SYMBOL  News sentiment analysis
+    compare A B       Compare two stocks side-by-side
+    backtest SYM      Simple MA crossover backtest
+""",
+        'watchlist': """
+  """ + Style.BRIGHT + """WATCHLIST & ALERTS""" + Style.RESET_ALL + """
+    watch, w          View watchlist
+    watch add SYM     Add symbol to watchlist
+    scan              Scan watchlist for oversold/trending
+    alert, a          View all price alerts
+    alert add SYM PRICE [above/below]  Set a price alert
+    alert rm #        Remove alert by number
+""",
+        'settings': """
+  """ + Style.BRIGHT + """SETTINGS""" + Style.RESET_ALL + """
+    refresh           Clear cached data for fresh updates
+    debug             Toggle debug mode
+    tips              Toggle contextual tips on/off
+""",
+    }
+    
+    if keyword:
+        keyword = keyword.lower()
+        found = False
+        for section, content in help_sections.items():
+            if keyword in section or keyword in content.lower():
+                print(Fore.CYAN + content + Style.RESET_ALL)
+                found = True
+        if not found:
+            print(f"  No help found for '{keyword}'. Try: portfolio, leaps, risk, quote, market, analysis, watchlist")
+    else:
+        # Print full help
+        print(Fore.CYAN + """
+╔══════════════════════════════════════════════════════════════════════════════╗
+║  STOCK TICKER v12.2.0 — HELP                                                 ║
+╠══════════════════════════════════════════════════════════════════════════════╣
+║  💡 Smart Context: Commands remember last symbol. Just type 'ta' again!      ║
+║  💡 Shortcuts: p=portfolio, m=market, t=ta, lp=leaps, g=greeks              ║
+║  💡 Search Help: 'help portfolio', 'help leaps', 'help analysis'            ║
+╚══════════════════════════════════════════════════════════════════════════════╝""" + Style.RESET_ALL)
+        for content in help_sections.values():
+            print(Fore.CYAN + content + Style.RESET_ALL)
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# END NEW UX COMPONENTS
+# ═══════════════════════════════════════════════════════════════════════════════
+
+import pandas as pd
+import numpy as np
+import requests
+
+# Set Logging Levels
+logging.getLogger("yfinance").setLevel(logging.CRITICAL)
+logging.getLogger("urllib3").setLevel(logging.CRITICAL)
+logging.getLogger("requests").setLevel(logging.CRITICAL)
+import yfinance as yf
+
+# --- OPTIONAL IMPORTS ---
+try:
+    from scipy.stats import norm, linregress
+    HAS_SCIPY = True
+except ImportError:
+    HAS_SCIPY = False
+
+try:
+    import matplotlib.pyplot as plt
+    HAS_MATPLOTLIB = True
+except:
+    HAS_MATPLOTLIB = False
+
+try:
+    from tabulate import tabulate
+except ImportError:
+    def tabulate(data, headers=None, tablefmt="simple"):
+        if not data: return ""
+        lines = []
+        if headers:
+            lines.append(" | ".join(str(h) for h in headers))
+            lines.append("-" * 80)
+        for row in data:
+            lines.append(" | ".join(str(c) for c in row))
+        return "\n".join(lines)
+
+try:
+    from colorama import init as _ci, Fore, Style
+    _ci(autoreset=True)
+except ImportError:
+    class Fore:
+        GREEN = RED = YELLOW = MAGENTA = CYAN = WHITE = BLUE = RESET = ""
+    class Style:
+        RESET_ALL = BRIGHT = ""
+
+# --- CONSTANTS ---
+COMPANY_TO_TICKER = {
+    'PURECYCLE TECHNOLOGIES INC': 'PCT', 'APPLE INC': 'AAPL', 'MICROSOFT CORP': 'MSFT',
+    'TESLA INC': 'TSLA', 'NVIDIA CORP': 'NVDA', 'AMAZON COM INC': 'AMZN',
+    'ALPHABET INC': 'GOOGL', 'META PLATFORMS INC': 'META', 'PALANTIR TECHNOLOGIES': 'PLTR',
+    'ADVANCED MICRO DEVICES': 'AMD', 'INTEL CORP': 'INTC', 'COINBASE GLOBAL': 'COIN',
+    'ROBINHOOD MARKETS': 'HOOD', 'SOFI TECHNOLOGIES': 'SOFI', 'ROCKET LAB USA': 'RKLB',
+    'ARCHER AVIATION': 'ACHR', 'JOBY AVIATION': 'JOBY', 'AST SPACEMOBILE': 'ASTS',
+    'OKLO INC': 'OKLO', 'CARVANA CO': 'CVNA', 'UBER TECHNOLOGIES': 'UBER',
+    'REDDIT INC': 'RDDT', 'MICRON TECHNOLOGY': 'MU'
+}
+
+# Popular stocks for random discovery feature
+DISCOVERY_STOCKS = [
+    # Tech Giants
+    'AAPL', 'MSFT', 'GOOGL', 'AMZN', 'META', 'NVDA', 'TSLA',
+    # Growth Tech
+    'PLTR', 'SNOW', 'CRWD', 'DDOG', 'NET', 'SHOP', 'SQ', 'PYPL',
+    # Semiconductors  
+    'AMD', 'INTC', 'MU', 'QCOM', 'AVGO', 'TSM', 'ASML',
+    # EV & Clean Energy
+    'RIVN', 'LCID', 'NIO', 'ENPH', 'SEDG', 'FSLR',
+    # Finance
+    'JPM', 'BAC', 'GS', 'MS', 'V', 'MA', 'AXP', 'COIN', 'HOOD', 'SOFI',
+    # Healthcare
+    'UNH', 'JNJ', 'PFE', 'MRNA', 'LLY', 'ABBV',
+    # Consumer
+    'NKE', 'SBUX', 'MCD', 'DIS', 'NFLX', 'COST', 'WMT', 'TGT',
+    # Industrials
+    'CAT', 'DE', 'BA', 'GE', 'HON', 'UPS', 'FDX',
+    # Space & Defense
+    'RKLB', 'ASTS', 'LMT', 'RTX', 'NOC',
+    # REITs
+    'O', 'SPG', 'AMT', 'CCI',
+    # Energy
+    'XOM', 'CVX', 'COP', 'OXY',
+    # Dividend Kings
+    'KO', 'PG', 'MMM', 'JNJ', 'PEP',
+]
+
+# Sector ETFs for heatmap
+SECTOR_ETFS = {
+    'Technology': 'XLK',
+    'Healthcare': 'XLV',
+    'Financials': 'XLF',
+    'Consumer Disc': 'XLY',
+    'Communication': 'XLC',
+    'Industrials': 'XLI',
+    'Consumer Stpl': 'XLP',
+    'Energy': 'XLE',
+    'Utilities': 'XLU',
+    'Real Estate': 'XLRE',
+    'Materials': 'XLB',
+}
+
+# --- UTILS ---
+def _now(): return time.time()
+def today_str(): return datetime.now().strftime("%Y-%m-%d")
+
+# --- RATE LIMITER ---
+class RateLimiter:
+    """Thread-safe rate limiter for API calls"""
+    def __init__(self, calls_per_second: float = 2.0, burst: int = 5):
+        self.calls_per_second = calls_per_second
+        self.burst = burst
+        self.tokens = burst
+        self.last_update = _now()
+        self.lock = threading.Lock()
+    
+    def acquire(self, timeout: float = 30.0) -> bool:
+        """Acquire a token, blocking if necessary. Returns True if acquired."""
+        deadline = _now() + timeout
+        while _now() < deadline:
+            with self.lock:
+                now = _now()
+                # Add tokens based on time elapsed
+                elapsed = now - self.last_update
+                self.tokens = min(self.burst, self.tokens + elapsed * self.calls_per_second)
+                self.last_update = now
+                
+                if self.tokens >= 1:
+                    self.tokens -= 1
+                    return True
+            time.sleep(0.1)
+        return False
+
+# Global rate limiter for API calls
+_api_limiter = RateLimiter(calls_per_second=3.0, burst=10)
+
+def retry_on_failure(max_retries: int = 3, delay: float = 1.0, backoff: float = 2.0):
+    """Decorator for retrying failed operations with exponential backoff"""
+    def decorator(func: Callable):
+        @wraps(func)
+        def wrapper(*args, **kwargs):
+            last_exception = None
+            current_delay = delay
+            for attempt in range(max_retries):
+                try:
+                    _api_limiter.acquire()
+                    return func(*args, **kwargs)
+                except Exception as e:
+                    last_exception = e
+                    if attempt < max_retries - 1:
+                        time.sleep(current_delay)
+                        current_delay *= backoff
+            if last_exception:
+                raise last_exception
+            return None
+        return wrapper
+    return decorator
+
+def validate_symbol(symbol: str) -> Optional[str]:
+    """Validate and clean a stock symbol"""
+    if not symbol:
+        return None
+    cleaned = re.sub(r'[^A-Za-z0-9.-]', '', symbol.upper().strip())
+    if len(cleaned) < 1 or len(cleaned) > 10:
+        return None
+    return cleaned
+
+def validate_number(value: Any, min_val: float = None, max_val: float = None, default: float = 0.0) -> float:
+    """Validate and sanitize numeric input"""
+    try:
+        num = float(value)
+        if math.isnan(num) or math.isinf(num):
+            return default
+        if min_val is not None and num < min_val:
+            return min_val
+        if max_val is not None and num > max_val:
+            return max_val
+        return num
+    except (TypeError, ValueError):
+        return default
+
 def safe_float(val, default=0.0):
     if val is None: return default
     if isinstance(val, (int, float)):
@@ -200,6 +728,9 @@ class Config:
     debug: bool = False
     show_charts: bool = True
     benchmark: str = "SPY"
+    show_tips: bool = True  # NEW v12.1: Toggle contextual tips
+    first_run: bool = True  # NEW v12.1: Track first run for welcome
+    
     def __post_init__(self): Path(self.data_dir).mkdir(parents=True, exist_ok=True)
     @classmethod
     def load(cls):
@@ -207,16 +738,1002 @@ class Config:
         p = Path(os.path.expanduser("~/.stockticker")) / "config.json"
         if p.exists():
             try:
-                for k, v in json.loads(p.read_text()).items():
+                data = json.loads(p.read_text())
+                for k, v in data.items():
                     if hasattr(cfg, k): setattr(cfg, k, v)
+                cfg.first_run = False  # Not first run if config exists
             except: pass
         cfg.__post_init__()
         return cfg
     def save(self):
         p = Path(self.data_dir) / "config.json"
-        p.write_text(json.dumps({'theme': self.theme, 'debug': self.debug, 'show_charts': self.show_charts, 'risk_free_rate': self.risk_free_rate, 'benchmark': self.benchmark}, indent=2))
+        p.write_text(json.dumps({
+            'theme': self.theme, 'debug': self.debug, 'show_charts': self.show_charts, 
+            'risk_free_rate': self.risk_free_rate, 'benchmark': self.benchmark,
+            'show_tips': self.show_tips, 'first_run': False
+        }, indent=2))
 
 config = Config.load()
+
+# --- NEW v12: STOP-LOSS TRACKER ---
+class StopLossTracker:
+    """Track stop-loss and take-profit levels for positions"""
+    def __init__(self):
+        self.fp = Path(config.data_dir) / "stops.json"
+        self.stops = self._load()
+    
+    def _load(self) -> Dict:
+        if self.fp.exists():
+            try:
+                return json.loads(self.fp.read_text())
+            except:
+                pass
+        return {}
+    
+    def _save(self):
+        self.fp.write_text(json.dumps(self.stops, indent=2))
+    
+    def add(self, symbol: str, stop_loss: float = None, take_profit: float = None, trailing_pct: float = None):
+        """Add stop-loss and/or take-profit for a symbol"""
+        symbol = validate_symbol(symbol)
+        if not symbol:
+            err("Invalid symbol")
+            return
+        
+        entry = self.stops.get(symbol, {})
+        if stop_loss:
+            entry['stop_loss'] = validate_number(stop_loss, min_val=0.01)
+        if take_profit:
+            entry['take_profit'] = validate_number(take_profit, min_val=0.01)
+        if trailing_pct:
+            entry['trailing_pct'] = validate_number(trailing_pct, min_val=0.1, max_val=50.0)
+            entry['trailing_high'] = entry.get('trailing_high', 0)
+        
+        entry['created'] = datetime.now().isoformat()
+        self.stops[symbol] = entry
+        self._save()
+        success(f"Stop levels set for {symbol}")
+    
+    def remove(self, symbol: str):
+        symbol = validate_symbol(symbol)
+        if symbol in self.stops:
+            del self.stops[symbol]
+            self._save()
+            success(f"Removed stops for {symbol}")
+        else:
+            err(f"No stops found for {symbol}")
+    
+    def check(self, fetcher) -> List[Dict]:
+        """Check all stops against current prices and return triggered ones"""
+        triggered = []
+        updated = False
+        
+        for symbol, levels in list(self.stops.items()):
+            try:
+                price_data = fetcher.get_stock_price(symbol)
+                price = price_data.get('price', 0)
+                if price <= 0:
+                    continue
+                
+                # Update trailing stop high watermark
+                if 'trailing_pct' in levels:
+                    if price > levels.get('trailing_high', 0):
+                        levels['trailing_high'] = price
+                        updated = True
+                    
+                    # Calculate trailing stop level
+                    trailing_stop = levels['trailing_high'] * (1 - levels['trailing_pct'] / 100)
+                    if price <= trailing_stop:
+                        triggered.append({
+                            'symbol': symbol,
+                            'type': 'trailing_stop',
+                            'level': trailing_stop,
+                            'price': price,
+                            'high': levels['trailing_high']
+                        })
+                
+                # Check fixed stop loss
+                if 'stop_loss' in levels and price <= levels['stop_loss']:
+                    triggered.append({
+                        'symbol': symbol,
+                        'type': 'stop_loss',
+                        'level': levels['stop_loss'],
+                        'price': price
+                    })
+                
+                # Check take profit
+                if 'take_profit' in levels and price >= levels['take_profit']:
+                    triggered.append({
+                        'symbol': symbol,
+                        'type': 'take_profit',
+                        'level': levels['take_profit'],
+                        'price': price
+                    })
+            except:
+                pass
+        
+        if updated:
+            self._save()
+        
+        return triggered
+    
+    def show(self, fetcher):
+        """Display all stop levels with current prices"""
+        if not self.stops:
+            warn("No stop levels set. Use 'stops add SYMBOL --stop PRICE' to add.")
+            return
+        
+        print(Fore.CYAN + f"\n{'═'*80}\n 🎯 STOP-LOSS / TAKE-PROFIT TRACKER\n{'═'*80}" + Style.RESET_ALL)
+        
+        rows = []
+        for symbol, levels in sorted(self.stops.items()):
+            try:
+                price_data = fetcher.get_stock_price(symbol)
+                price = price_data.get('price', 0)
+                
+                stop = levels.get('stop_loss', '-')
+                tp = levels.get('take_profit', '-')
+                trail = levels.get('trailing_pct', '-')
+                
+                # Calculate distances
+                stop_dist = ""
+                tp_dist = ""
+                
+                if price > 0:
+                    if isinstance(stop, (int, float)):
+                        pct = (price - stop) / price * 100
+                        stop_dist = f" ({pct:+.1f}%)"
+                        stop = f"${stop:.2f}"
+                    if isinstance(tp, (int, float)):
+                        pct = (tp - price) / price * 100
+                        tp_dist = f" ({pct:+.1f}%)"
+                        tp = f"${tp:.2f}"
+                    if isinstance(trail, (int, float)):
+                        trail_level = levels.get('trailing_high', price) * (1 - trail / 100)
+                        trail = f"{trail:.1f}% (${trail_level:.2f})"
+                
+                rows.append([
+                    symbol,
+                    fmt_money(price) if price > 0 else '-',
+                    f"{stop}{stop_dist}",
+                    f"{tp}{tp_dist}",
+                    trail
+                ])
+            except:
+                rows.append([symbol, '-', '-', '-', '-'])
+        
+        print(tabulate(rows, headers=["Symbol", "Price", "Stop Loss", "Take Profit", "Trailing"]))
+        print(f"{'═'*80}\n")
+
+# --- NEW v12: POSITION SIZER ---
+class PositionSizer:
+    """Calculate optimal position sizes using various methods"""
+    
+    @staticmethod
+    def fixed_risk(account_size: float, risk_pct: float, entry: float, stop: float) -> Dict:
+        """Calculate position size based on fixed % risk per trade"""
+        if entry <= 0 or stop <= 0 or entry == stop:
+            return {'error': 'Invalid entry or stop price'}
+        
+        risk_amount = account_size * (risk_pct / 100)
+        risk_per_share = abs(entry - stop)
+        shares = int(risk_amount / risk_per_share)
+        position_value = shares * entry
+        
+        return {
+            'shares': shares,
+            'position_value': position_value,
+            'risk_amount': risk_amount,
+            'risk_per_share': risk_per_share,
+            'account_pct': (position_value / account_size) * 100
+        }
+    
+    @staticmethod
+    def kelly_criterion(win_rate: float, avg_win: float, avg_loss: float) -> float:
+        """Calculate Kelly Criterion percentage for position sizing"""
+        if avg_loss <= 0 or win_rate <= 0 or win_rate >= 1:
+            return 0.0
+        
+        # Kelly % = W - [(1-W) / R] where W = win rate, R = win/loss ratio
+        r = abs(avg_win / avg_loss)
+        kelly = win_rate - ((1 - win_rate) / r)
+        
+        # Cap at 25% (half-Kelly is often recommended)
+        return max(0, min(kelly, 0.25))
+    
+    @staticmethod
+    def volatility_adjusted(account_size: float, target_risk: float, price: float, atr: float) -> Dict:
+        """Calculate position size adjusted for volatility (ATR-based)"""
+        if atr <= 0 or price <= 0:
+            return {'error': 'Invalid ATR or price'}
+        
+        # Risk amount based on 2x ATR as stop distance
+        risk_amount = account_size * (target_risk / 100)
+        stop_distance = atr * 2
+        shares = int(risk_amount / stop_distance)
+        position_value = shares * price
+        
+        return {
+            'shares': shares,
+            'position_value': position_value,
+            'atr': atr,
+            'stop_distance': stop_distance,
+            'suggested_stop': price - stop_distance,
+            'account_pct': (position_value / account_size) * 100
+        }
+
+# --- NEW v12: PERFORMANCE TRACKER ---
+class PerformanceTracker:
+    """Track portfolio performance over time"""
+    def __init__(self):
+        self.fp = Path(config.data_dir) / "performance.json"
+        self.history = self._load()
+    
+    def _load(self) -> List[Dict]:
+        if self.fp.exists():
+            try:
+                return json.loads(self.fp.read_text())
+            except:
+                pass
+        return []
+    
+    def _save(self):
+        # Keep last 365 days of snapshots
+        cutoff = (datetime.now() - timedelta(days=365)).isoformat()
+        self.history = [h for h in self.history if h.get('date', '') > cutoff]
+        self.fp.write_text(json.dumps(self.history, indent=2))
+    
+    def record_snapshot(self, total_value: float, total_cost: float, cash: float, positions: int):
+        """Record a portfolio snapshot"""
+        today = today_str()
+        
+        # Update or add today's snapshot
+        for snap in self.history:
+            if snap.get('date') == today:
+                snap['value'] = total_value
+                snap['cost'] = total_cost
+                snap['cash'] = cash
+                snap['positions'] = positions
+                snap['pnl'] = total_value - total_cost
+                snap['pnl_pct'] = ((total_value - total_cost) / total_cost * 100) if total_cost > 0 else 0
+                self._save()
+                return
+        
+        # Add new snapshot
+        self.history.append({
+            'date': today,
+            'value': total_value,
+            'cost': total_cost,
+            'cash': cash,
+            'positions': positions,
+            'pnl': total_value - total_cost,
+            'pnl_pct': ((total_value - total_cost) / total_cost * 100) if total_cost > 0 else 0
+        })
+        self._save()
+    
+    def get_stats(self) -> Dict:
+        """Calculate performance statistics"""
+        if len(self.history) < 2:
+            return {'error': 'Need at least 2 snapshots for statistics'}
+        
+        sorted_hist = sorted(self.history, key=lambda x: x['date'])
+        values = [h['value'] for h in sorted_hist]
+        
+        # Calculate returns
+        returns = []
+        for i in range(1, len(values)):
+            if values[i-1] > 0:
+                returns.append((values[i] - values[i-1]) / values[i-1])
+        
+        if not returns:
+            return {'error': 'Insufficient data'}
+        
+        # Calculate metrics
+        total_return = (values[-1] - values[0]) / values[0] * 100 if values[0] > 0 else 0
+        
+        avg_return = sum(returns) / len(returns) * 100
+        std_dev = (sum((r - avg_return/100)**2 for r in returns) / len(returns)) ** 0.5 * 100
+        
+        # Sharpe ratio (annualized, assuming daily data)
+        rf_daily = config.risk_free_rate / 252
+        excess_returns = [r - rf_daily for r in returns]
+        sharpe = 0
+        if std_dev > 0:
+            sharpe = (sum(excess_returns) / len(excess_returns)) / (std_dev/100) * (252 ** 0.5)
+        
+        # Max drawdown
+        peak = values[0]
+        max_dd = 0
+        for v in values:
+            if v > peak:
+                peak = v
+            dd = (peak - v) / peak if peak > 0 else 0
+            max_dd = max(max_dd, dd)
+        
+        # Win days
+        up_days = sum(1 for r in returns if r > 0)
+        down_days = sum(1 for r in returns if r < 0)
+        
+        return {
+            'total_return': total_return,
+            'avg_daily_return': avg_return,
+            'volatility': std_dev,
+            'sharpe_ratio': sharpe,
+            'max_drawdown': max_dd * 100,
+            'up_days': up_days,
+            'down_days': down_days,
+            'win_rate': up_days / (up_days + down_days) * 100 if (up_days + down_days) > 0 else 0,
+            'start_value': values[0],
+            'end_value': values[-1],
+            'days_tracked': len(sorted_hist)
+        }
+    
+    def show(self):
+        """Display performance statistics"""
+        print(Fore.CYAN + f"\n{'═'*70}\n 📈 PERFORMANCE HISTORY\n{'═'*70}" + Style.RESET_ALL)
+        
+        stats = self.get_stats()
+        if 'error' in stats:
+            warn(stats['error'])
+            return
+        
+        print(f"\n  {Style.BRIGHT}OVERALL PERFORMANCE{Style.RESET_ALL}")
+        print(f"    Total Return:      {color_pct(stats['total_return'])}")
+        print(f"    Start Value:       {fmt_money(stats['start_value'])}")
+        print(f"    Current Value:     {fmt_money(stats['end_value'])}")
+        
+        print(f"\n  {Style.BRIGHT}RISK METRICS{Style.RESET_ALL}")
+        print(f"    Volatility:        {stats['volatility']:.2f}% daily")
+        print(f"    Sharpe Ratio:      {stats['sharpe_ratio']:.2f}")
+        print(f"    Max Drawdown:      {Fore.RED}{stats['max_drawdown']:.1f}%{Style.RESET_ALL}")
+        
+        print(f"\n  {Style.BRIGHT}TRADING STATS{Style.RESET_ALL}")
+        print(f"    Days Tracked:      {stats['days_tracked']}")
+        print(f"    Up Days:           {Fore.GREEN}{stats['up_days']}{Style.RESET_ALL}")
+        print(f"    Down Days:         {Fore.RED}{stats['down_days']}{Style.RESET_ALL}")
+        print(f"    Win Rate:          {stats['win_rate']:.1f}%")
+        
+        # Show recent history
+        if self.history:
+            print(f"\n  {Style.BRIGHT}RECENT SNAPSHOTS{Style.RESET_ALL}")
+            recent = sorted(self.history, key=lambda x: x['date'], reverse=True)[:7]
+            for snap in recent:
+                pnl_color = Fore.GREEN if snap.get('pnl', 0) >= 0 else Fore.RED
+                print(f"    {snap['date']}  Value: {fmt_money(snap['value'])}  P&L: {pnl_color}{fmt_money(snap.get('pnl', 0))}{Style.RESET_ALL}")
+        
+        print(f"{'═'*70}\n")
+
+# --- NEW v12: CORRELATION ANALYZER ---
+class CorrelationAnalyzer:
+    """Analyze correlation between portfolio holdings"""
+    
+    @staticmethod
+    def calculate_correlation_matrix(symbols: List[str], fetcher, period: str = "6mo") -> Optional[pd.DataFrame]:
+        """Calculate correlation matrix for given symbols"""
+        if len(symbols) < 2:
+            return None
+        
+        # Fetch historical data
+        price_data = {}
+        for sym in symbols[:15]:  # Limit to 15 symbols for performance
+            df = fetcher.get_history(sym, period)
+            if df is not None and not df.empty:
+                price_data[sym] = df['Close'].pct_change().dropna()
+        
+        if len(price_data) < 2:
+            return None
+        
+        # Align data
+        combined = pd.DataFrame(price_data)
+        combined = combined.dropna()
+        
+        if len(combined) < 20:
+            return None
+        
+        return combined.corr()
+    
+    @staticmethod
+    def find_highly_correlated(corr_matrix: pd.DataFrame, threshold: float = 0.7) -> List[Tuple[str, str, float]]:
+        """Find pairs of highly correlated assets"""
+        pairs = []
+        symbols = corr_matrix.columns.tolist()
+        
+        for i, sym1 in enumerate(symbols):
+            for j, sym2 in enumerate(symbols):
+                if i < j:  # Only upper triangle
+                    corr = corr_matrix.loc[sym1, sym2]
+                    if abs(corr) >= threshold:
+                        pairs.append((sym1, sym2, corr))
+        
+        return sorted(pairs, key=lambda x: abs(x[2]), reverse=True)
+    
+    @staticmethod
+    def portfolio_diversification_score(corr_matrix: pd.DataFrame) -> float:
+        """Calculate diversification score (0-100, higher is better)"""
+        if corr_matrix is None or corr_matrix.empty:
+            return 0.0
+        
+        # Average absolute correlation (excluding diagonal)
+        n = len(corr_matrix)
+        if n < 2:
+            return 0.0
+        
+        total_corr = 0
+        count = 0
+        for i in range(n):
+            for j in range(n):
+                if i != j:
+                    total_corr += abs(corr_matrix.iloc[i, j])
+                    count += 1
+        
+        avg_corr = total_corr / count if count > 0 else 0
+        # Score: 100 means perfectly uncorrelated, 0 means perfectly correlated
+        return max(0, (1 - avg_corr) * 100)
+
+# --- NEW v12: REBALANCER ---
+class PortfolioRebalancer:
+    """Suggest portfolio rebalancing actions"""
+    
+    # Default target allocations by sector
+    DEFAULT_TARGETS = {
+        'Technology': 25,
+        'Healthcare': 15,
+        'Financials': 15,
+        'Consumer Cyclical': 12,
+        'Industrials': 10,
+        'Communication Services': 8,
+        'Consumer Defensive': 7,
+        'Energy': 5,
+        'Utilities': 3,
+    }
+    
+    @staticmethod
+    def analyze(stocks: Dict, fetcher, targets: Dict = None) -> Dict:
+        """Analyze current allocation vs targets and suggest rebalancing"""
+        if not stocks:
+            return {'error': 'No stocks in portfolio'}
+        
+        targets = targets or PortfolioRebalancer.DEFAULT_TARGETS
+        
+        # Get sector for each holding
+        sector_values = defaultdict(float)
+        total_value = 0
+        
+        for sym, pos in stocks.items():
+            try:
+                meta = fetcher.get_meta(sym)
+                sector = meta.get('sector', 'Unknown')
+                price_data = fetcher.get_stock_price(sym)
+                value = pos['qty'] * price_data.get('price', pos.get('broker_price', 0))
+                sector_values[sector] += value
+                total_value += value
+            except:
+                pass
+        
+        if total_value <= 0:
+            return {'error': 'Could not calculate portfolio value'}
+        
+        # Calculate current allocations
+        current_alloc = {sector: (value / total_value * 100) for sector, value in sector_values.items()}
+        
+        # Generate suggestions
+        suggestions = []
+        for sector, target_pct in targets.items():
+            current_pct = current_alloc.get(sector, 0)
+            diff = current_pct - target_pct
+            
+            if abs(diff) > 3:  # Only suggest if off by more than 3%
+                action = "REDUCE" if diff > 0 else "INCREASE"
+                suggestions.append({
+                    'sector': sector,
+                    'current': current_pct,
+                    'target': target_pct,
+                    'diff': diff,
+                    'action': action,
+                    'amount': abs(diff / 100 * total_value)
+                })
+        
+        # Sort by magnitude of imbalance
+        suggestions.sort(key=lambda x: abs(x['diff']), reverse=True)
+        
+        return {
+            'total_value': total_value,
+            'current_allocation': current_alloc,
+            'target_allocation': targets,
+            'suggestions': suggestions,
+            'num_sectors': len(sector_values)
+        }
+
+# --- NEW v12: MULTI-TIMEFRAME ANALYZER ---
+class MultiTimeframeAnalyzer:
+    """Analyze a symbol across multiple timeframes"""
+    
+    TIMEFRAMES = [
+        ('1d', '15m', 'Intraday'),
+        ('5d', '1h', 'Short-term'),
+        ('1mo', '1d', 'Medium-term'),
+        ('3mo', '1d', 'Swing'),
+        ('1y', '1d', 'Long-term'),
+    ]
+    
+    @staticmethod
+    def analyze(symbol: str, fetcher) -> Dict:
+        """Analyze symbol across multiple timeframes"""
+        results = {}
+        
+        for period, interval, label in MultiTimeframeAnalyzer.TIMEFRAMES:
+            try:
+                df = fetcher.get_history(symbol, period)
+                if df is None or len(df) < 14:
+                    results[label] = {'error': 'Insufficient data'}
+                    continue
+                
+                close = df['Close']
+                
+                # RSI
+                rsi = TechnicalAnalysis.rsi(close).iloc[-1]
+                
+                # MACD
+                _, _, hist = TechnicalAnalysis.macd(close)
+                macd_signal = "BULLISH" if hist.iloc[-1] > 0 else "BEARISH"
+                
+                # Trend (price vs SMA)
+                sma_20 = close.rolling(min(20, len(close)-1)).mean().iloc[-1]
+                trend = "UP" if close.iloc[-1] > sma_20 else "DOWN"
+                
+                # Momentum
+                momentum = ((close.iloc[-1] - close.iloc[0]) / close.iloc[0] * 100) if close.iloc[0] > 0 else 0
+                
+                results[label] = {
+                    'rsi': rsi,
+                    'rsi_signal': 'OVERSOLD' if rsi < 30 else 'OVERBOUGHT' if rsi > 70 else 'Neutral',
+                    'macd': macd_signal,
+                    'trend': trend,
+                    'momentum': momentum,
+                    'price': close.iloc[-1]
+                }
+            except Exception as e:
+                results[label] = {'error': str(e)}
+        
+        # Calculate overall confluence
+        bullish_count = sum(1 for tf in results.values() if isinstance(tf, dict) and 
+                          ('BULLISH' in str(tf.get('macd', '')) or 'OVERSOLD' in str(tf.get('rsi_signal', ''))))
+        bearish_count = sum(1 for tf in results.values() if isinstance(tf, dict) and 
+                          ('BEARISH' in str(tf.get('macd', '')) or 'OVERBOUGHT' in str(tf.get('rsi_signal', ''))))
+        
+        results['confluence'] = {
+            'bullish': bullish_count,
+            'bearish': bearish_count,
+            'signal': 'BULLISH' if bullish_count > bearish_count else 'BEARISH' if bearish_count > bullish_count else 'MIXED'
+        }
+        
+        return results
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# NEW v12.2: LEAPS ANALYZER & MANAGEMENT
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class LEAPSAnalyzer:
+    """
+    Comprehensive LEAPS (Long-Term Equity Anticipation Securities) analyzer.
+    LEAPS are options with expiration dates typically 1-3 years out.
+    """
+    
+    # LEAPS are typically defined as options with > 270 days (9 months) to expiration
+    LEAPS_MIN_DTE = 270
+    
+    # Risk thresholds
+    THETA_DANGER_PCT = 0.15  # If theta > 0.15% of value per day, warn
+    DTE_DANGER = 90  # Warn when LEAPS drops below 90 DTE
+    DELTA_DEEP_ITM = 0.80
+    DELTA_ATM = 0.50
+    DELTA_OTM = 0.30
+    
+    @staticmethod
+    def is_leaps(expiration: str) -> bool:
+        """Check if an option qualifies as a LEAP"""
+        days = dte(expiration)
+        return days >= LEAPSAnalyzer.LEAPS_MIN_DTE
+    
+    @staticmethod
+    def classify_leaps(option: Dict, und_price: float) -> Dict:
+        """
+        Classify a LEAPS option and return detailed metrics.
+        
+        Returns:
+            Dict with classification, health score, and recommendations
+        """
+        days = dte(option['expiration'])
+        strike = option['strike']
+        opt_type = option['type']
+        qty = option['qty']
+        
+        # Moneyness calculation
+        if opt_type == 'call':
+            moneyness = (und_price - strike) / strike * 100
+            itm = und_price > strike
+        else:
+            moneyness = (strike - und_price) / strike * 100
+            itm = und_price < strike
+        
+        # Classification
+        if abs(moneyness) < 5:
+            classification = "ATM"
+        elif itm and abs(moneyness) >= 20:
+            classification = "Deep ITM"
+        elif itm:
+            classification = "ITM"
+        elif not itm and abs(moneyness) >= 20:
+            classification = "Deep OTM"
+        else:
+            classification = "OTM"
+        
+        # Time category
+        if days >= 730:  # 2+ years
+            time_category = "Long LEAPS"
+        elif days >= 365:  # 1-2 years
+            time_category = "LEAPS"
+        elif days >= LEAPSAnalyzer.LEAPS_MIN_DTE:
+            time_category = "Short LEAPS"
+        elif days >= 90:
+            time_category = "Medium-term"
+        else:
+            time_category = "Short-term"
+        
+        # Health scoring (0-100)
+        health_score = 100
+        warnings = []
+        
+        # Penalize for time decay acceleration zone
+        if days < 90:
+            health_score -= 40
+            warnings.append("⚠️ In theta decay acceleration zone (<90 DTE)")
+        elif days < 180:
+            health_score -= 20
+            warnings.append("⏰ Approaching theta acceleration zone")
+        elif days < 270:
+            health_score -= 10
+            warnings.append("📅 No longer qualifies as LEAPS")
+        
+        # Penalize deep OTM
+        if classification == "Deep OTM":
+            health_score -= 25
+            warnings.append("🎯 Deep OTM - low probability of profit")
+        elif classification == "OTM":
+            health_score -= 10
+        
+        # Bonus for deep ITM (stock replacement)
+        if classification == "Deep ITM":
+            health_score += 10
+        
+        # Check if roll should be considered
+        should_roll = days < 180 or (days < 270 and classification in ["OTM", "Deep OTM"])
+        
+        return {
+            'classification': classification,
+            'time_category': time_category,
+            'days': days,
+            'moneyness': moneyness,
+            'itm': itm,
+            'health_score': max(0, min(100, health_score)),
+            'warnings': warnings,
+            'should_roll': should_roll,
+            'is_leaps': days >= LEAPSAnalyzer.LEAPS_MIN_DTE
+        }
+    
+    @staticmethod
+    def calculate_roll_analysis(option: Dict, und_price: float, iv: float, fetcher) -> Dict:
+        """
+        Analyze potential rolls for a LEAPS position.
+        
+        Returns recommendations for rolling out, up, down, or out-and-up/down.
+        """
+        current_days = dte(option['expiration'])
+        strike = option['strike']
+        opt_type = option['type']
+        
+        T = max(current_days / 365.0, 0.001)
+        
+        # Current position value
+        current_price = BlackScholes.price(und_price, strike, T, config.risk_free_rate, iv, opt_type)
+        current_greeks = BlackScholes.calculate_all_greeks(und_price, strike, T, config.risk_free_rate, iv, opt_type)
+        
+        roll_options = []
+        
+        # Generate roll candidates (out 6 months, 12 months)
+        for months_out in [6, 12]:
+            target_days = current_days + (months_out * 30)
+            target_T = target_days / 365.0
+            
+            # Same strike (roll out)
+            new_price = BlackScholes.price(und_price, strike, target_T, config.risk_free_rate, iv, opt_type)
+            new_greeks = BlackScholes.calculate_all_greeks(und_price, strike, target_T, config.risk_free_rate, iv, opt_type)
+            
+            roll_cost = new_price - current_price
+            theta_improvement = new_greeks['theta'] - current_greeks['theta']  # Less negative is better
+            
+            roll_options.append({
+                'type': f"Roll Out {months_out}mo",
+                'new_strike': strike,
+                'new_dte': target_days,
+                'roll_cost': roll_cost,
+                'new_delta': new_greeks['delta'],
+                'new_theta': new_greeks['theta'],
+                'theta_improvement': theta_improvement,
+                'new_price': new_price
+            })
+            
+            # Roll out and up/down (adjust strike by ~5%)
+            if opt_type == 'call':
+                new_strike = round(strike * 1.05, 0)  # Roll up
+            else:
+                new_strike = round(strike * 0.95, 0)  # Roll down
+            
+            new_price_adjusted = BlackScholes.price(und_price, new_strike, target_T, config.risk_free_rate, iv, opt_type)
+            new_greeks_adjusted = BlackScholes.calculate_all_greeks(und_price, new_strike, target_T, config.risk_free_rate, iv, opt_type)
+            
+            roll_cost_adjusted = new_price_adjusted - current_price
+            
+            direction = "Up" if opt_type == 'call' else "Down"
+            roll_options.append({
+                'type': f"Roll Out+{direction} {months_out}mo",
+                'new_strike': new_strike,
+                'new_dte': target_days,
+                'roll_cost': roll_cost_adjusted,
+                'new_delta': new_greeks_adjusted['delta'],
+                'new_theta': new_greeks_adjusted['theta'],
+                'theta_improvement': new_greeks_adjusted['theta'] - current_greeks['theta'],
+                'new_price': new_price_adjusted
+            })
+        
+        # Find best roll (minimize cost while maximizing theta improvement)
+        for r in roll_options:
+            # Score: higher is better
+            # Prioritize theta improvement (less decay) and lower cost
+            r['score'] = (r['theta_improvement'] * 365 * 100) - (r['roll_cost'] / current_price * 10)
+        
+        roll_options.sort(key=lambda x: x['score'], reverse=True)
+        
+        return {
+            'current_price': current_price,
+            'current_delta': current_greeks['delta'],
+            'current_theta': current_greeks['theta'],
+            'current_gamma': current_greeks['gamma'],
+            'current_vega': current_greeks['vega'],
+            'roll_options': roll_options,
+            'best_roll': roll_options[0] if roll_options else None
+        }
+    
+    @staticmethod
+    def find_leaps_opportunities(symbol: str, fetcher, budget: float = 10000) -> List[Dict]:
+        """
+        Find LEAPS buying opportunities for a given symbol.
+        
+        Looks for options with:
+        - High delta (0.60-0.80) for stock replacement
+        - Reasonable cost relative to stock
+        - Good time value
+        """
+        opportunities = []
+        
+        try:
+            ticker = yf.Ticker(symbol)
+            und_price_data = fetcher.get_stock_price(symbol)
+            und_price = und_price_data.get('price', 0)
+            
+            if und_price <= 0:
+                return []
+            
+            # Get available expirations
+            expirations = ticker.options
+            leaps_expirations = [exp for exp in expirations if dte(exp) >= LEAPSAnalyzer.LEAPS_MIN_DTE]
+            
+            for exp in leaps_expirations[:3]:  # Check first 3 LEAPS expirations
+                try:
+                    chain = ticker.option_chain(exp)
+                    calls = chain.calls
+                    
+                    # Filter for reasonable strikes (60-100% of current price for calls)
+                    target_strikes = calls[(calls['strike'] >= und_price * 0.60) & 
+                                          (calls['strike'] <= und_price * 1.0)]
+                    
+                    for _, row in target_strikes.iterrows():
+                        strike = row['strike']
+                        bid = safe_float(row.get('bid', 0))
+                        ask = safe_float(row.get('ask', 0))
+                        mid_price = (bid + ask) / 2 if bid > 0 and ask > 0 else safe_float(row.get('lastPrice', 0))
+                        iv = safe_float(row.get('impliedVolatility', 0.3))
+                        
+                        if mid_price <= 0:
+                            continue
+                        
+                        days = dte(exp)
+                        T = days / 365.0
+                        
+                        # Calculate Greeks
+                        greeks = BlackScholes.calculate_all_greeks(und_price, strike, T, config.risk_free_rate, iv, 'call')
+                        delta = greeks['delta']
+                        
+                        # Filter for target delta range (stock replacement candidates)
+                        if delta < 0.55 or delta > 0.90:
+                            continue
+                        
+                        # Cost analysis
+                        contract_cost = mid_price * 100
+                        max_contracts = int(budget / contract_cost)
+                        
+                        if max_contracts < 1:
+                            continue
+                        
+                        # Equivalent stock exposure
+                        shares_controlled = delta * 100
+                        stock_cost_equivalent = shares_controlled * und_price
+                        leverage = stock_cost_equivalent / contract_cost
+                        
+                        # Breakeven
+                        breakeven = strike + mid_price
+                        breakeven_pct = (breakeven - und_price) / und_price * 100
+                        
+                        # Intrinsic and extrinsic
+                        intrinsic = max(0, und_price - strike)
+                        extrinsic = mid_price - intrinsic
+                        extrinsic_pct = extrinsic / mid_price * 100 if mid_price > 0 else 0
+                        
+                        opportunities.append({
+                            'symbol': symbol,
+                            'expiration': exp,
+                            'dte': days,
+                            'strike': strike,
+                            'price': mid_price,
+                            'contract_cost': contract_cost,
+                            'delta': delta,
+                            'theta': greeks['theta'],
+                            'gamma': greeks['gamma'],
+                            'vega': greeks['vega'],
+                            'iv': iv,
+                            'intrinsic': intrinsic,
+                            'extrinsic': extrinsic,
+                            'extrinsic_pct': extrinsic_pct,
+                            'breakeven': breakeven,
+                            'breakeven_pct': breakeven_pct,
+                            'leverage': leverage,
+                            'max_contracts': max_contracts,
+                            'shares_controlled': shares_controlled,
+                            'und_price': und_price
+                        })
+                
+                except Exception as e:
+                    if config.debug:
+                        print(f"  Debug: Error processing {exp}: {e}")
+                    continue
+            
+            # Sort by leverage (best stock replacement value)
+            opportunities.sort(key=lambda x: x['leverage'], reverse=True)
+            
+        except Exception as e:
+            if config.debug:
+                print(f"  Debug: LEAPS chain error: {e}")
+        
+        return opportunities[:10]  # Return top 10
+
+
+class PortfolioGreeksAnalyzer:
+    """Analyze total portfolio Greeks exposure across all options positions"""
+    
+    @staticmethod
+    def calculate_portfolio_greeks(options: List[Dict], fetcher, stock_prices: Dict) -> Dict:
+        """
+        Calculate aggregate Greeks for entire options portfolio.
+        
+        Returns:
+            Dict with total delta, gamma, theta, vega, and breakdown by underlying
+        """
+        totals = {
+            'delta': 0,
+            'gamma': 0,
+            'theta': 0,
+            'vega': 0,
+            'delta_dollars': 0,
+            'theta_daily': 0,
+            'vega_dollars': 0
+        }
+        
+        by_underlying = defaultdict(lambda: {
+            'delta': 0, 'gamma': 0, 'theta': 0, 'vega': 0,
+            'contracts': 0, 'value': 0, 'delta_dollars': 0
+        })
+        
+        by_expiry = defaultdict(lambda: {
+            'delta': 0, 'theta': 0, 'contracts': 0, 'value': 0
+        })
+        
+        leaps_positions = []
+        non_leaps_positions = []
+        
+        for o in options:
+            sym = o['symbol']
+            und_price = stock_prices.get(sym, {}).get('price', 0)
+            
+            if und_price <= 0:
+                continue
+            
+            days = dte(o['expiration'])
+            T = max(days / 365.0, 0.001)
+            qty = o['qty']
+            
+            # Get option price and IV
+            opt_data = fetcher.get_option_price(sym, o['expiration'], o['strike'], o['type'], und_price)
+            iv = opt_data.get('iv', 0.3)
+            opt_price = opt_data.get('price', 0)
+            
+            # Calculate Greeks
+            greeks = BlackScholes.calculate_all_greeks(
+                und_price, o['strike'], T, config.risk_free_rate, iv, o['type']
+            )
+            
+            # Scale by position size (qty contracts * 100 shares)
+            position_delta = greeks['delta'] * qty * 100
+            position_gamma = greeks['gamma'] * qty * 100
+            position_theta = greeks['theta'] * qty * 100
+            position_vega = greeks['vega'] * qty * 100
+            
+            # Dollar exposures
+            delta_dollars = position_delta * und_price
+            
+            # Aggregate totals
+            totals['delta'] += position_delta
+            totals['gamma'] += position_gamma
+            totals['theta'] += position_theta
+            totals['vega'] += position_vega
+            totals['delta_dollars'] += delta_dollars
+            totals['theta_daily'] += position_theta
+            
+            # By underlying
+            by_underlying[sym]['delta'] += position_delta
+            by_underlying[sym]['gamma'] += position_gamma
+            by_underlying[sym]['theta'] += position_theta
+            by_underlying[sym]['vega'] += position_vega
+            by_underlying[sym]['contracts'] += abs(qty)
+            by_underlying[sym]['value'] += abs(qty) * opt_price * 100
+            by_underlying[sym]['delta_dollars'] += delta_dollars
+            by_underlying[sym]['und_price'] = und_price
+            
+            # By expiry
+            exp = o['expiration']
+            by_expiry[exp]['delta'] += position_delta
+            by_expiry[exp]['theta'] += position_theta
+            by_expiry[exp]['contracts'] += abs(qty)
+            by_expiry[exp]['value'] += abs(qty) * opt_price * 100
+            
+            # Track LEAPS vs non-LEAPS
+            position_info = {
+                'symbol': sym,
+                'expiration': o['expiration'],
+                'strike': o['strike'],
+                'type': o['type'],
+                'qty': qty,
+                'dte': days,
+                'delta': greeks['delta'],
+                'theta': greeks['theta'],
+                'position_delta': position_delta,
+                'position_theta': position_theta,
+                'value': abs(qty) * opt_price * 100
+            }
+            
+            if LEAPSAnalyzer.is_leaps(o['expiration']):
+                leaps_positions.append(position_info)
+            else:
+                non_leaps_positions.append(position_info)
+        
+        return {
+            'totals': totals,
+            'by_underlying': dict(by_underlying),
+            'by_expiry': dict(by_expiry),
+            'leaps_positions': leaps_positions,
+            'non_leaps_positions': non_leaps_positions,
+            'leaps_count': len(leaps_positions),
+            'non_leaps_count': len(non_leaps_positions)
+        }
 
 # --- MATH ---
 class BlackScholes:
@@ -1180,6 +2697,13 @@ class Portfolio:
         print(f"  {Style.BRIGHT}TOTAL P&L:{Style.RESET_ALL}    {color_pnl(total_pnl, (total_pnl/total_cost*100) if total_cost else 0)}")
         if cash: print(f"  {Style.BRIGHT}CASH:{Style.RESET_ALL}         {fmt_money(cash)}")
         print(f"{'═'*95}\n")
+        
+        # Auto-record performance snapshot
+        try:
+            perf = PerformanceTracker()
+            perf.record_snapshot(total_val + cash, total_cost, cash, len(stocks) + len(options))
+        except:
+            pass  # Silently fail if performance tracking has issues
 
     def analyze_risk(self, fetcher):
         print(Fore.CYAN + f"\n{'═'*60}\n RISK & BETA ANALYSIS\n{'═'*60}" + Style.RESET_ALL)
@@ -1806,7 +3330,7 @@ class TradeSignals:
 def print_help():
     print(Fore.CYAN + """
 ╔══════════════════════════════════════════════════════════════════════════════╗
-║  STOCK TICKER v11.0.0 — HELP & MANUAL                                        ║
+║  STOCK TICKER v12.0.0 — HELP & MANUAL                                        ║
 ╠══════════════════════════════════════════════════════════════════════════════╣
 ║  SMART CONTEXT: Commands remember last symbol. Just type 'ta' again!         ║
 ║                                                                              ║
@@ -1818,6 +3342,17 @@ def print_help():
 ║  divs            Show dividend income & upcoming ex-dates                    ║
 ║  stats           Quick portfolio health stats at a glance                    ║
 ║  clear           Delete all portfolio data (reset)                           ║
+║                                                                              ║
+║  NEW v12 — RISK MANAGEMENT:                                                  ║
+║  stops           View all stop-loss and take-profit levels                   ║
+║  stops add SYM --stop PRICE [--tp PRICE] [--trail PCT]                       ║
+║  stops rm SYM    Remove stops for symbol                                     ║
+║  size SYM        Position sizing calculator (risk-based)                     ║
+║  perf            View portfolio performance history & metrics                ║
+║  corr            Portfolio correlation matrix & diversification              ║
+║  rebalance       Get portfolio rebalancing suggestions                       ║
+║  mtf SYMBOL      Multi-timeframe analysis                                    ║
+║  export [csv]    Export portfolio report (PDF default, or CSV)               ║
 ║                                                                              ║
 ║  QUOTE & LOOKUP:                                                             ║
 ║  AAPL            Just type ticker for quick quote (sets context)             ║
@@ -1860,27 +3395,62 @@ def print_help():
 
 # --- MAIN ---
 def main():
-    print(Fore.CYAN + Style.BRIGHT + "\n    STOCK TICKER v11.0.0 — Universal + Charts + Signals + Alerts\n" + Style.RESET_ALL)
-    fetcher, pf, wl, alerts = PriceFetcher(), Portfolio(), Watchlist(), PriceAlerts()
-    last_symbol = None
+    # NEW v12.1: Enhanced welcome experience
+    print_welcome()
+    if config.first_run:
+        print_quick_start()
+        config.first_run = False
+        config.save()
+    else:
+        print(f"  {Fore.CYAN}Type 'help' for commands or just enter a ticker symbol{Style.RESET_ALL}\n")
     
-    # Check alerts on startup
+    fetcher, pf, wl, alerts = PriceFetcher(), Portfolio(), Watchlist(), PriceAlerts()
+    stops = StopLossTracker()
+    perf_tracker = PerformanceTracker()
+    last_symbol = None
+    portfolio_value = 0  # NEW v12.1: Track for prompt display
+    
+    # Check alerts and stops on startup
     triggered = alerts.check(fetcher)
     if triggered:
-        print(Fore.YELLOW + Style.BRIGHT + "\n  🔔 TRIGGERED ALERTS:" + Style.RESET_ALL)
+        print(Fore.YELLOW + Style.BRIGHT + "\n  🔔 TRIGGERED PRICE ALERTS:" + Style.RESET_ALL)
         for a in triggered:
             print(f"     {a['symbol']} hit ${a['target']:.2f} (now ${a.get('trigger_price', 0):.2f})")
         print()
     
+    triggered_stops = stops.check(fetcher)
+    if triggered_stops:
+        print(Fore.RED + Style.BRIGHT + "\n  🚨 TRIGGERED STOPS:" + Style.RESET_ALL)
+        for s in triggered_stops:
+            if s['type'] == 'stop_loss':
+                print(f"     {s['symbol']} hit STOP LOSS at ${s['level']:.2f} (now ${s['price']:.2f})")
+            elif s['type'] == 'take_profit':
+                print(Fore.GREEN + f"     {s['symbol']} hit TAKE PROFIT at ${s['level']:.2f} (now ${s['price']:.2f})" + Style.RESET_ALL)
+            elif s['type'] == 'trailing_stop':
+                print(f"     {s['symbol']} hit TRAILING STOP at ${s['level']:.2f} (high: ${s['high']:.2f}, now: ${s['price']:.2f})")
+        print()
+    
     while True:
         try:
-            prompt_sym = f"[{last_symbol}] " if last_symbol else ""
-            raw = input(Fore.GREEN + f"▶ {prompt_sym}" + Style.RESET_ALL).strip()
+            # NEW v12.1: Rich prompt showing portfolio value and context
+            prompt = format_prompt(portfolio_value, last_symbol)
+            raw = input(prompt).strip()
             if not raw: continue
             
             parts = shlex.split(raw)
             cmd = parts[0].lower()
             args = parts[1:]
+            
+            # NEW v12.1: Apply command aliases
+            if cmd in COMMAND_ALIASES:
+                cmd = COMMAND_ALIASES[cmd]
+            
+            # NEW v12.1: Smart command suggestions for typos
+            if cmd not in ALL_COMMANDS and cmd not in COMMAND_ALIASES and len(cmd) > 2:
+                suggestion = suggest_command(cmd)
+                if suggestion:
+                    print(f"  {Fore.YELLOW}Did you mean '{suggestion}'?{Style.RESET_ALL}")
+                    continue
             
             # --- CONTEXT HANDLING ---
             symbol_commands = ('quote', 'q', 'ta', 'ta2', 'trend', 'levels', 'info', 'news', 'dash', 'chart', 'signals', 'sentiment', 'backtest')
@@ -1893,8 +3463,20 @@ def main():
             
             # --- COMMANDS ---
             if cmd in ('quit', 'exit'): break
-            elif cmd == 'import': pf.import_csv(args[0]) if args else err("Usage: import <file>")
-            elif cmd in ('pf', 'portfolio'): pf.display(fetcher)
+            elif cmd == 'import': 
+                if args:
+                    pf.import_csv(args[0])
+                    print_tip('import')
+                else: 
+                    print_error("Usage: import <file>", "Example: import ~/Downloads/portfolio.csv")
+            elif cmd in ('pf', 'portfolio'): 
+                pf.display(fetcher)
+                # Update portfolio value for prompt
+                stocks = pf.data.get('stocks', {})
+                if stocks:
+                    total = sum(fetcher.get_stock_price(s).get('price', 0) * p['qty'] for s, p in stocks.items())
+                    portfolio_value = total + pf.data.get('cash', 0)
+                print_tip('pf')
             elif cmd == 'risk': pf.analyze_risk(fetcher)
             elif cmd == 'cal': pf.calendar(fetcher)
             elif cmd == 'watch': 
@@ -1902,9 +3484,18 @@ def main():
                 elif args[0]=='add': wl.add(args[1])
                 elif args[0] in ('rm','del'): wl.remove(args[1])
             elif cmd == 'clear': pf.clear()
-            elif cmd == 'debug': config.debug = not config.debug; print(f"Debug: {config.debug}")
+            elif cmd == 'debug': config.debug = not config.debug; print(f"  Debug: {config.debug}"); config.save()
+            elif cmd == 'tips': 
+                config.show_tips = not config.show_tips
+                print(f"  Contextual tips: {'ON' if config.show_tips else 'OFF'}")
+                config.save()
             elif cmd == 'refresh': fetcher.clear_cache(); success("Cache cleared")
-            elif cmd in ('help', 'h', '?'): print_help()
+            elif cmd in ('help', 'h', '?'): 
+                # NEW v12.1: Searchable help
+                if args:
+                    print_searchable_help(args[0])
+                else:
+                    print_searchable_help()
 
             # --- NEW: MARKET OVERVIEW ---
             elif cmd == 'market':
@@ -1921,6 +3512,7 @@ def main():
                         except: pass
                 print(tabulate(rows, headers=["Index", "Price", "Change", "% Change"]))
                 print(f"{'═'*60}\n")
+                print_tip('market')
 
             # --- NEW v11: SECTOR HEATMAP ---
             elif cmd == 'sectors':
@@ -2520,9 +4112,815 @@ def main():
                 print(f"  {symbol}: {fmt_money(d['price'])} ({color_pct(d['pct'])})")
                 last_symbol = symbol
             
+            # --- NEW v12: STOP-LOSS TRACKER ---
+            elif cmd == 'stops':
+                if not args:
+                    stops.show(fetcher)
+                elif args[0] == 'add' and len(args) >= 2:
+                    symbol = args[1].upper()
+                    stop_loss = None
+                    take_profit = None
+                    trailing = None
+                    
+                    # Parse optional arguments
+                    i = 2
+                    while i < len(args):
+                        if args[i] in ('--stop', '-s') and i + 1 < len(args):
+                            stop_loss = float(args[i + 1])
+                            i += 2
+                        elif args[i] in ('--tp', '-t') and i + 1 < len(args):
+                            take_profit = float(args[i + 1])
+                            i += 2
+                        elif args[i] in ('--trail', '-tr') and i + 1 < len(args):
+                            trailing = float(args[i + 1])
+                            i += 2
+                        else:
+                            # Assume it's a stop loss price
+                            try:
+                                stop_loss = float(args[i])
+                            except:
+                                pass
+                            i += 1
+                    
+                    if stop_loss or take_profit or trailing:
+                        stops.add(symbol, stop_loss, take_profit, trailing)
+                    else:
+                        err("Usage: stops add SYMBOL [--stop PRICE] [--tp PRICE] [--trail PCT]")
+                elif args[0] in ('rm', 'remove', 'del') and len(args) >= 2:
+                    stops.remove(args[1].upper())
+                elif args[0] == 'check':
+                    triggered = stops.check(fetcher)
+                    if triggered:
+                        for s in triggered:
+                            print(f"  🚨 {s['symbol']} triggered {s['type']} at ${s['level']:.2f}")
+                    else:
+                        print("  No stops triggered")
+                else:
+                    err("Usage: stops | stops add SYM --stop PRICE | stops rm SYM")
+            
+            # --- NEW v12: POSITION SIZING ---
+            elif cmd == 'size':
+                if not args:
+                    err("Usage: size SYMBOL [--risk PCT] [--stop PRICE] [--account SIZE]")
+                    continue
+                
+                symbol = args[0].upper()
+                risk_pct = 2.0  # Default 2% risk
+                stop_price = None
+                account_size = 100000  # Default $100k
+                
+                # Parse arguments
+                i = 1
+                while i < len(args):
+                    if args[i] in ('--risk', '-r') and i + 1 < len(args):
+                        risk_pct = float(args[i + 1])
+                        i += 2
+                    elif args[i] in ('--stop', '-s') and i + 1 < len(args):
+                        stop_price = float(args[i + 1])
+                        i += 2
+                    elif args[i] in ('--account', '-a') and i + 1 < len(args):
+                        account_size = float(args[i + 1])
+                        i += 2
+                    else:
+                        i += 1
+                
+                print(Fore.CYAN + f"\n{'═'*70}\n 📐 POSITION SIZING — {symbol}\n{'═'*70}" + Style.RESET_ALL)
+                
+                d = fetcher.get_stock_price(symbol)
+                price = d.get('price', 0)
+                
+                if price <= 0:
+                    err(f"Could not get price for {symbol}")
+                else:
+                    df = fetcher.get_history(symbol, "3mo")
+                    
+                    print(f"\n  {Style.BRIGHT}INPUTS{Style.RESET_ALL}")
+                    print(f"    Current Price:    {fmt_money(price)}")
+                    print(f"    Account Size:     {fmt_money(account_size)}")
+                    print(f"    Risk Tolerance:   {risk_pct}%")
+                    
+                    # Method 1: Fixed Risk (if stop provided)
+                    if stop_price:
+                        result = PositionSizer.fixed_risk(account_size, risk_pct, price, stop_price)
+                        print(f"\n  {Style.BRIGHT}FIXED RISK METHOD{Style.RESET_ALL}")
+                        print(f"    Stop Loss:        {fmt_money(stop_price)}")
+                        print(f"    Risk per Share:   {fmt_money(result['risk_per_share'])}")
+                        print(f"    Position Size:    {Fore.GREEN}{result['shares']} shares{Style.RESET_ALL}")
+                        print(f"    Position Value:   {fmt_money(result['position_value'])}")
+                        print(f"    Account %:        {result['account_pct']:.1f}%")
+                    
+                    # Method 2: Volatility-adjusted (ATR-based)
+                    if df is not None and len(df) > 14:
+                        atr = TechnicalAnalysis.atr(df).iloc[-1]
+                        result = PositionSizer.volatility_adjusted(account_size, risk_pct, price, atr)
+                        
+                        print(f"\n  {Style.BRIGHT}VOLATILITY-ADJUSTED (ATR){Style.RESET_ALL}")
+                        print(f"    ATR (14-day):     {fmt_money(result['atr'])}")
+                        print(f"    Stop Distance:    {fmt_money(result['stop_distance'])} (2x ATR)")
+                        print(f"    Suggested Stop:   {fmt_money(result['suggested_stop'])}")
+                        print(f"    Position Size:    {Fore.GREEN}{result['shares']} shares{Style.RESET_ALL}")
+                        print(f"    Position Value:   {fmt_money(result['position_value'])}")
+                        print(f"    Account %:        {result['account_pct']:.1f}%")
+                    
+                    # Kelly Criterion hint
+                    print(f"\n  {Style.BRIGHT}KELLY CRITERION{Style.RESET_ALL}")
+                    print(f"    {Fore.YELLOW}Tip: Use 'backtest {symbol}' to get win rate for Kelly calculation{Style.RESET_ALL}")
+                    
+                print(f"{'═'*70}\n")
+                last_symbol = symbol
+            
+            # --- NEW v12: PERFORMANCE TRACKING ---
+            elif cmd == 'perf':
+                perf_tracker.show()
+            
+            # --- NEW v12: CORRELATION ANALYSIS ---
+            elif cmd == 'corr':
+                stocks = pf.data.get('stocks', {})
+                if not stocks:
+                    print_error("No stocks in portfolio", "Use 'import <file.csv>' to load your portfolio")
+                    continue
+                
+                symbols = list(stocks.keys())
+                if len(symbols) < 2:
+                    print_error("Need at least 2 stocks for correlation analysis", "Add more positions to analyze diversification")
+                    continue
+                
+                print(Fore.CYAN + f"\n{'═'*80}\n 🔗 CORRELATION ANALYSIS\n{'═'*80}" + Style.RESET_ALL)
+                
+                prog = ProgressBar(len(symbols), "  Analyzing")
+                corr_matrix = CorrelationAnalyzer.calculate_correlation_matrix(symbols, fetcher)
+                prog.done()
+                
+                if corr_matrix is None:
+                    err("Could not calculate correlation matrix")
+                else:
+                    # Diversification score
+                    div_score = CorrelationAnalyzer.portfolio_diversification_score(corr_matrix)
+                    div_color = Fore.GREEN if div_score >= 60 else Fore.YELLOW if div_score >= 40 else Fore.RED
+                    
+                    print(f"\n  {Style.BRIGHT}DIVERSIFICATION SCORE:{Style.RESET_ALL} {div_color}{div_score:.1f}/100{Style.RESET_ALL}")
+                    if div_score >= 60:
+                        print(f"    {Fore.GREEN}Well diversified portfolio{Style.RESET_ALL}")
+                    elif div_score >= 40:
+                        print(f"    {Fore.YELLOW}Moderately diversified - consider adding uncorrelated assets{Style.RESET_ALL}")
+                    else:
+                        print(f"    {Fore.RED}Highly correlated - significant concentration risk{Style.RESET_ALL}")
+                    
+                    # Highly correlated pairs
+                    pairs = CorrelationAnalyzer.find_highly_correlated(corr_matrix, threshold=0.7)
+                    if pairs:
+                        print(f"\n  {Style.BRIGHT}HIGHLY CORRELATED PAIRS (>70%):{Style.RESET_ALL}")
+                        for sym1, sym2, corr in pairs[:5]:
+                            color = Fore.RED if corr > 0.85 else Fore.YELLOW
+                            print(f"    {sym1} ↔ {sym2}: {color}{corr:.2f}{Style.RESET_ALL}")
+                    
+                    # Show matrix for small portfolios
+                    if len(symbols) <= 8:
+                        print(f"\n  {Style.BRIGHT}CORRELATION MATRIX:{Style.RESET_ALL}")
+                        # Format matrix for display
+                        header = [""] + list(corr_matrix.columns)
+                        rows = []
+                        for idx in corr_matrix.index:
+                            row = [idx]
+                            for col in corr_matrix.columns:
+                                val = corr_matrix.loc[idx, col]
+                                if idx == col:
+                                    row.append("1.00")
+                                else:
+                                    color = Fore.RED if abs(val) > 0.7 else Fore.YELLOW if abs(val) > 0.4 else Fore.RESET
+                                    row.append(f"{color}{val:.2f}{Style.RESET_ALL}")
+                            rows.append(row)
+                        print(tabulate(rows, headers=header, tablefmt="simple"))
+                
+                print(f"{'═'*80}\n")
+            
+            # --- NEW v12: REBALANCING ---
+            elif cmd == 'rebalance':
+                stocks = pf.data.get('stocks', {})
+                if not stocks:
+                    print_error("No stocks in portfolio", "Use 'import <file.csv>' to load your portfolio")
+                    continue
+                
+                print_header("PORTFOLIO REBALANCING", icon="🔄")
+                
+                result = PortfolioRebalancer.analyze(stocks, fetcher)
+                
+                if 'error' in result:
+                    err(result['error'])
+                else:
+                    print(f"\n  {Style.BRIGHT}PORTFOLIO VALUE:{Style.RESET_ALL} {fmt_money(result['total_value'])}")
+                    print(f"  {Style.BRIGHT}SECTORS HELD:{Style.RESET_ALL} {result['num_sectors']}")
+                    
+                    # Current allocation
+                    print(f"\n  {Style.BRIGHT}CURRENT ALLOCATION:{Style.RESET_ALL}")
+                    for sector, pct in sorted(result['current_allocation'].items(), key=lambda x: x[1], reverse=True):
+                        target = result['target_allocation'].get(sector, 0)
+                        diff = pct - target
+                        diff_color = Fore.RED if abs(diff) > 5 else Fore.YELLOW if abs(diff) > 2 else Fore.GREEN
+                        bar_len = int(pct / 2)
+                        bar = "█" * bar_len
+                        print(f"    {sector:<20} {bar:<15} {pct:>5.1f}% (target: {target}%) {diff_color}{diff:+.1f}%{Style.RESET_ALL}")
+                    
+                    # Suggestions
+                    if result['suggestions']:
+                        print(f"\n  {Style.BRIGHT}REBALANCING SUGGESTIONS:{Style.RESET_ALL}")
+                        for sug in result['suggestions'][:5]:
+                            action_color = Fore.RED if sug['action'] == 'REDUCE' else Fore.GREEN
+                            print(f"    {action_color}{sug['action']}{Style.RESET_ALL} {sug['sector']}: "
+                                  f"{sug['current']:.1f}% → {sug['target']:.1f}% (${abs(sug['amount']):,.0f})")
+                    else:
+                        print(f"\n  {Fore.GREEN}Portfolio is well balanced!{Style.RESET_ALL}")
+                
+                print(f"{'═'*80}\n")
+            
+            # --- NEW v12: MULTI-TIMEFRAME ANALYSIS ---
+            elif cmd == 'mtf' and args:
+                symbol = args[0].upper()
+                print(Fore.CYAN + f"\n{'═'*80}\n ⏱️ MULTI-TIMEFRAME ANALYSIS — {symbol}\n{'═'*80}" + Style.RESET_ALL)
+                
+                results = MultiTimeframeAnalyzer.analyze(symbol, fetcher)
+                
+                d = fetcher.get_stock_price(symbol)
+                print(f"\n  {Style.BRIGHT}CURRENT PRICE:{Style.RESET_ALL} {fmt_money(d.get('price', 0))} ({color_pct(d.get('pct', 0))})")
+                
+                print(f"\n  {Style.BRIGHT}TIMEFRAME BREAKDOWN:{Style.RESET_ALL}")
+                rows = []
+                for label in ['Intraday', 'Short-term', 'Medium-term', 'Swing', 'Long-term']:
+                    data = results.get(label, {})
+                    if 'error' in data:
+                        rows.append([label, '-', '-', '-', '-'])
+                    else:
+                        rsi = data.get('rsi', 0)
+                        rsi_str = f"{rsi:.1f}" if rsi else '-'
+                        rsi_signal = data.get('rsi_signal', '-')
+                        macd = data.get('macd', '-')
+                        trend = data.get('trend', '-')
+                        momentum = data.get('momentum', 0)
+                        
+                        rows.append([
+                            label,
+                            rsi_str,
+                            color_signal(rsi_signal),
+                            color_signal(macd),
+                            f"{Fore.GREEN if momentum > 0 else Fore.RED}{momentum:+.1f}%{Style.RESET_ALL}"
+                        ])
+                
+                print(tabulate(rows, headers=["Timeframe", "RSI", "RSI Signal", "MACD", "Momentum"]))
+                
+                # Confluence
+                conf = results.get('confluence', {})
+                print(f"\n  {Style.BRIGHT}CONFLUENCE:{Style.RESET_ALL}")
+                print(f"    Bullish Signals: {Fore.GREEN}{conf.get('bullish', 0)}{Style.RESET_ALL}")
+                print(f"    Bearish Signals: {Fore.RED}{conf.get('bearish', 0)}{Style.RESET_ALL}")
+                overall = conf.get('signal', 'MIXED')
+                overall_color = Fore.GREEN if overall == 'BULLISH' else Fore.RED if overall == 'BEARISH' else Fore.YELLOW
+                print(f"    Overall: {overall_color}{Style.BRIGHT}{overall}{Style.RESET_ALL}")
+                
+                print(f"{'═'*80}\n")
+                last_symbol = symbol
+            
+            # --- NEW v12: EXPORT REPORT ---
+            elif cmd == 'export':
+                stocks = pf.data.get('stocks', {})
+                options = pf.data.get('options', [])
+                
+                if not stocks and not options:
+                    warn("No positions to export. Import data first.")
+                    continue
+                
+                fmt = 'csv' if args and args[0].lower() == 'csv' else 'txt'
+                timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+                filename = Path(config.data_dir) / f"portfolio_report_{timestamp}.{fmt}"
+                
+                try:
+                    with open(filename, 'w') as f:
+                        if fmt == 'csv':
+                            # CSV export
+                            f.write("Type,Symbol,Quantity,Cost,Value,P&L,P&L %\n")
+                            
+                            for sym, pos in stocks.items():
+                                price_data = fetcher.get_stock_price(sym)
+                                price = price_data.get('price', pos.get('broker_price', 0))
+                                val = pos['qty'] * price
+                                pnl = val - pos['cost']
+                                pnl_pct = (pnl / pos['cost'] * 100) if pos['cost'] > 0 else 0
+                                f.write(f"Stock,{sym},{pos['qty']},{pos['cost']:.2f},{val:.2f},{pnl:.2f},{pnl_pct:.2f}\n")
+                            
+                            for o in options:
+                                f.write(f"Option,{o['symbol']} {o['expiration']} ${o['strike']} {o['type']},{o['qty']},{o['cost']:.2f},-,-\n")
+                        else:
+                            # Text report
+                            f.write("=" * 80 + "\n")
+                            f.write(f"PORTFOLIO REPORT - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+                            f.write("=" * 80 + "\n\n")
+                            
+                            f.write("STOCKS\n")
+                            f.write("-" * 80 + "\n")
+                            total_val = 0
+                            total_pnl = 0
+                            for sym, pos in sorted(stocks.items()):
+                                price_data = fetcher.get_stock_price(sym)
+                                price = price_data.get('price', pos.get('broker_price', 0))
+                                val = pos['qty'] * price
+                                pnl = val - pos['cost']
+                                total_val += val
+                                total_pnl += pnl
+                                f.write(f"{sym:<8} {pos['qty']:>10.2f} shares @ ${pos.get('avg', 0):>8.2f} = ${val:>12,.2f}  P&L: ${pnl:>10,.2f}\n")
+                            
+                            f.write("\n" + "=" * 80 + "\n")
+                            f.write(f"TOTAL VALUE: ${total_val:,.2f}\n")
+                            f.write(f"TOTAL P&L:   ${total_pnl:,.2f}\n")
+                            f.write("=" * 80 + "\n")
+                    
+                    success(f"Report exported to: {filename}")
+                except Exception as e:
+                    err(f"Export failed: {e}")
+            
+            # ═══════════════════════════════════════════════════════════════════════════════
+            # NEW v12.2: LEAPS COMMANDS
+            # ═══════════════════════════════════════════════════════════════════════════════
+            
+            # --- LEAPS DASHBOARD ---
+            elif cmd == 'leaps':
+                options = pf.data.get('options', [])
+                if not options:
+                    print_error("No options in portfolio", "Use 'import <file.csv>' to load your portfolio")
+                    continue
+                
+                print_header("LEAPS PORTFOLIO DASHBOARD", icon="📊")
+                
+                # Fetch underlying prices first
+                all_symbols = set(o['symbol'] for o in options)
+                stock_prices = {}
+                prog = ProgressBar(len(all_symbols), "  Fetching prices")
+                with ThreadPoolExecutor(max_workers=10) as executor:
+                    futures = {executor.submit(fetcher.get_stock_price, sym): sym for sym in all_symbols}
+                    for i, f in enumerate(as_completed(futures)):
+                        sym = futures[f]
+                        stock_prices[sym] = f.result()
+                        prog.update(i, sym)
+                prog.done()
+                
+                # Separate LEAPS from other options
+                leaps_options = []
+                other_options = []
+                
+                for o in options:
+                    days = dte(o['expiration'])
+                    if days >= LEAPSAnalyzer.LEAPS_MIN_DTE:
+                        leaps_options.append(o)
+                    else:
+                        other_options.append(o)
+                
+                if not leaps_options:
+                    warn(f"No LEAPS found (options with >{LEAPSAnalyzer.LEAPS_MIN_DTE} DTE)")
+                    if other_options:
+                        print(f"\n  You have {len(other_options)} non-LEAPS options. Consider rolling them out.")
+                    continue
+                
+                # Process each LEAPS
+                leaps_data = []
+                total_leaps_value = 0
+                total_leaps_cost = 0
+                total_theta = 0
+                total_delta = 0
+                
+                prog = ProgressBar(len(leaps_options), "  Analyzing LEAPS")
+                for i, o in enumerate(leaps_options):
+                    sym = o['symbol']
+                    und_price = stock_prices.get(sym, {}).get('price', 0)
+                    
+                    # Get option price
+                    opt_data = fetcher.get_option_price(sym, o['expiration'], o['strike'], o['type'], und_price)
+                    opt_price = opt_data.get('price', 0) or o.get('broker_price', 0)
+                    iv = opt_data.get('iv', 0.3)
+                    
+                    # Classify LEAPS
+                    classification = LEAPSAnalyzer.classify_leaps(o, und_price)
+                    
+                    # Calculate Greeks
+                    days = dte(o['expiration'])
+                    T = max(days / 365.0, 0.001)
+                    greeks = BlackScholes.calculate_all_greeks(und_price, o['strike'], T, config.risk_free_rate, iv, o['type'])
+                    
+                    # Values
+                    qty = o['qty']
+                    cost = o['cost']
+                    val = abs(qty) * opt_price * 100
+                    pnl = val - cost if qty > 0 else cost - val
+                    pnl_pct = (pnl / cost * 100) if cost > 0 else 0
+                    
+                    # Position Greeks
+                    pos_delta = greeks['delta'] * qty * 100
+                    pos_theta = greeks['theta'] * qty * 100
+                    
+                    total_leaps_value += val if qty > 0 else -val
+                    total_leaps_cost += cost
+                    total_theta += pos_theta
+                    total_delta += pos_delta
+                    
+                    # Intrinsic/Extrinsic
+                    intrinsic = max(0, und_price - o['strike']) if o['type'] == 'call' else max(0, o['strike'] - und_price)
+                    extrinsic = max(0, opt_price - intrinsic)
+                    extr_pct = (extrinsic / opt_price * 100) if opt_price > 0 else 0
+                    
+                    # Breakeven
+                    if o['type'] == 'call':
+                        breakeven = o['strike'] + (cost / abs(qty) / 100) if qty > 0 else o['strike'] + opt_price
+                    else:
+                        breakeven = o['strike'] - (cost / abs(qty) / 100) if qty > 0 else o['strike'] - opt_price
+                    
+                    leaps_data.append({
+                        'option': o,
+                        'und_price': und_price,
+                        'opt_price': opt_price,
+                        'classification': classification,
+                        'greeks': greeks,
+                        'pos_delta': pos_delta,
+                        'pos_theta': pos_theta,
+                        'iv': iv,
+                        'val': val,
+                        'cost': cost,
+                        'pnl': pnl,
+                        'pnl_pct': pnl_pct,
+                        'intrinsic': intrinsic,
+                        'extrinsic': extrinsic,
+                        'extr_pct': extr_pct,
+                        'breakeven': breakeven
+                    })
+                    prog.update(i, sym)
+                prog.done()
+                
+                # Sort by DTE
+                leaps_data.sort(key=lambda x: x['classification']['days'])
+                
+                # Summary
+                print(f"\n  {Style.BRIGHT}LEAPS SUMMARY{Style.RESET_ALL}")
+                print(f"    Total LEAPS:       {len(leaps_options)} positions")
+                print(f"    Total Value:       {fmt_money(total_leaps_value)}")
+                print(f"    Total Cost Basis:  {fmt_money(total_leaps_cost)}")
+                total_pnl = total_leaps_value - total_leaps_cost
+                print(f"    Total P&L:         {color_pnl(total_pnl, (total_pnl/total_leaps_cost*100) if total_leaps_cost else 0)}")
+                print(f"    Net Delta:         {total_delta:+.1f} shares")
+                print(f"    Daily Theta:       {Fore.RED if total_theta < 0 else Fore.GREEN}${total_theta:.2f}/day{Style.RESET_ALL}")
+                
+                # Table of LEAPS
+                print(f"\n  {Style.BRIGHT}LEAPS POSITIONS{Style.RESET_ALL}\n" + "─"*100)
+                rows = []
+                for ld in leaps_data:
+                    o = ld['option']
+                    c = ld['classification']
+                    g = ld['greeks']
+                    
+                    # Format description
+                    desc = f"{o['symbol']} {o['expiration'][5:]} ${o['strike']:.0f}{o['type'][0].upper()}"
+                    if o['qty'] < 0:
+                        desc = f"-{desc}"
+                    
+                    # Health color
+                    health = c['health_score']
+                    if health >= 80:
+                        health_str = Fore.GREEN + f"{health}" + Style.RESET_ALL
+                    elif health >= 60:
+                        health_str = Fore.YELLOW + f"{health}" + Style.RESET_ALL
+                    else:
+                        health_str = Fore.RED + f"{health}" + Style.RESET_ALL
+                    
+                    # DTE color
+                    days = c['days']
+                    if days >= 365:
+                        dte_str = Fore.GREEN + f"{days}d" + Style.RESET_ALL
+                    elif days >= 180:
+                        dte_str = Fore.YELLOW + f"{days}d" + Style.RESET_ALL
+                    else:
+                        dte_str = Fore.RED + f"{days}d" + Style.RESET_ALL
+                    
+                    rows.append([
+                        desc,
+                        c['classification'],
+                        dte_str,
+                        f"Δ{g['delta']:.2f}",
+                        f"θ${ld['pos_theta']:.2f}",
+                        f"{ld['iv']*100:.0f}%",
+                        f"I:{ld['intrinsic']:.1f}/E:{ld['extr_pct']:.0f}%",
+                        fmt_money(ld['val']),
+                        color_pnl(ld['pnl'], ld['pnl_pct']),
+                        health_str
+                    ])
+                
+                print(tabulate(rows, headers=["Position", "Type", "DTE", "Delta", "Theta/d", "IV", "Int/Ext", "Value", "P&L", "Health"]))
+                
+                # Warnings
+                warnings = []
+                for ld in leaps_data:
+                    for w in ld['classification']['warnings']:
+                        warnings.append(f"{ld['option']['symbol']}: {w}")
+                
+                if warnings:
+                    print(f"\n  {Style.BRIGHT}⚠️  ALERTS{Style.RESET_ALL}")
+                    for w in warnings[:5]:
+                        print(f"    {w}")
+                
+                # Roll recommendations
+                roll_candidates = [ld for ld in leaps_data if ld['classification']['should_roll']]
+                if roll_candidates:
+                    print(f"\n  {Style.BRIGHT}🔄 ROLL RECOMMENDATIONS{Style.RESET_ALL}")
+                    for ld in roll_candidates[:3]:
+                        o = ld['option']
+                        print(f"    {o['symbol']} {o['expiration']} ${o['strike']}{o['type'][0].upper()} — "
+                              f"{ld['classification']['days']} DTE, consider rolling out")
+                    print(f"\n  {Fore.CYAN}Use 'leapsroll {roll_candidates[0]['option']['symbol']}' for detailed roll analysis{Style.RESET_ALL}")
+                
+                # Non-LEAPS summary
+                if other_options:
+                    print(f"\n  {Style.BRIGHT}NON-LEAPS OPTIONS{Style.RESET_ALL}")
+                    print(f"    You have {len(other_options)} options under {LEAPSAnalyzer.LEAPS_MIN_DTE} DTE")
+                    print(f"    Consider converting to LEAPS for reduced time decay")
+                
+                print_footer(100)
+            
+            # --- LEAPS ROLL OPTIMIZER ---
+            elif cmd == 'leapsroll':
+                if not args:
+                    err("Usage: leapsroll SYMBOL [--current EXP] [--budget AMOUNT]")
+                    continue
+                
+                symbol = args[0].upper()
+                options = pf.data.get('options', [])
+                
+                # Find LEAPS for this symbol
+                symbol_leaps = [o for o in options if o['symbol'] == symbol and LEAPSAnalyzer.is_leaps(o['expiration'])]
+                
+                if not symbol_leaps:
+                    # Check for any options on this symbol
+                    symbol_opts = [o for o in options if o['symbol'] == symbol]
+                    if symbol_opts:
+                        warn(f"No LEAPS found for {symbol}, but you have {len(symbol_opts)} options. Consider rolling to LEAPS.")
+                    else:
+                        warn(f"No options found for {symbol} in portfolio")
+                    continue
+                
+                print_header(f"LEAPS ROLL OPTIMIZER — {symbol}", icon="🔄")
+                
+                # Get underlying price
+                d = fetcher.get_stock_price(symbol)
+                und_price = d.get('price', 0)
+                
+                if und_price <= 0:
+                    err(f"Could not get price for {symbol}")
+                    continue
+                
+                print(f"\n  {Style.BRIGHT}CURRENT PRICE:{Style.RESET_ALL} {fmt_money(und_price)} ({color_pct(d.get('pct', 0))})")
+                
+                # Analyze each LEAPS position
+                for o in symbol_leaps:
+                    opt_data = fetcher.get_option_price(symbol, o['expiration'], o['strike'], o['type'], und_price)
+                    iv = opt_data.get('iv', 0.3)
+                    
+                    print(f"\n  {Style.BRIGHT}ANALYZING:{Style.RESET_ALL} {o['expiration']} ${o['strike']} {o['type'].upper()}")
+                    print(f"    Quantity:    {o['qty']} contracts")
+                    print(f"    Cost Basis:  {fmt_money(o['cost'])}")
+                    print(f"    Days Left:   {dte(o['expiration'])} DTE")
+                    
+                    # Get roll analysis
+                    analysis = LEAPSAnalyzer.calculate_roll_analysis(o, und_price, iv, fetcher)
+                    
+                    print(f"\n    {Style.BRIGHT}CURRENT POSITION GREEKS:{Style.RESET_ALL}")
+                    print(f"      Delta: {analysis['current_delta']:.3f}")
+                    print(f"      Theta: ${analysis['current_theta']:.4f}/day")
+                    print(f"      Gamma: {analysis['current_gamma']:.4f}")
+                    print(f"      Vega:  ${analysis['current_vega']:.2f}")
+                    print(f"      Price: ${analysis['current_price']:.2f}")
+                    
+                    print(f"\n    {Style.BRIGHT}ROLL OPTIONS:{Style.RESET_ALL}")
+                    print("    " + "─"*80)
+                    
+                    roll_rows = []
+                    for r in analysis['roll_options']:
+                        cost_color = Fore.RED if r['roll_cost'] > 0 else Fore.GREEN
+                        theta_color = Fore.GREEN if r['theta_improvement'] > 0 else Fore.RED
+                        
+                        roll_rows.append([
+                            r['type'],
+                            f"${r['new_strike']:.0f}",
+                            f"{r['new_dte']}d",
+                            f"Δ{r['new_delta']:.2f}",
+                            f"θ${r['new_theta']:.4f}",
+                            f"{cost_color}${r['roll_cost']:.2f}{Style.RESET_ALL}",
+                            f"{theta_color}{r['theta_improvement']*365:.2f}/yr{Style.RESET_ALL}"
+                        ])
+                    
+                    print("    " + tabulate(roll_rows, headers=["Roll Type", "Strike", "New DTE", "Delta", "Theta/d", "Net Cost", "θ Improv"]).replace("\n", "\n    "))
+                    
+                    # Best recommendation
+                    best = analysis['best_roll']
+                    if best:
+                        print(f"\n    {Style.BRIGHT}💡 RECOMMENDATION:{Style.RESET_ALL}")
+                        print(f"      {Fore.GREEN}{best['type']}{Style.RESET_ALL} to ${best['new_strike']} strike")
+                        print(f"      Net debit/credit: ${best['roll_cost']:.2f} per contract")
+                        print(f"      Total for {abs(o['qty'])} contracts: ${best['roll_cost'] * abs(o['qty']) * 100:.2f}")
+                
+                print_footer(90)
+            
+            # --- LEAPS CHAIN FINDER ---
+            elif cmd == 'leapschain':
+                if not args:
+                    err("Usage: leapschain SYMBOL [--budget AMOUNT]")
+                    continue
+                
+                symbol = args[0].upper()
+                budget = 10000  # Default
+                
+                # Parse budget
+                for i, arg in enumerate(args):
+                    if arg in ('--budget', '-b') and i + 1 < len(args):
+                        budget = float(args[i + 1])
+                
+                print_header(f"LEAPS OPPORTUNITIES — {symbol}", icon="🔍")
+                
+                d = fetcher.get_stock_price(symbol)
+                und_price = d.get('price', 0)
+                
+                if und_price <= 0:
+                    err(f"Could not get price for {symbol}")
+                    continue
+                
+                meta = fetcher.get_meta(symbol)
+                print(f"\n  {Style.BRIGHT}{meta.get('name', symbol)}{Style.RESET_ALL}")
+                print(f"  Current Price: {fmt_money(und_price)} ({color_pct(d.get('pct', 0))})")
+                print(f"  Budget: {fmt_money(budget)}")
+                
+                print(f"\n  {Fore.CYAN}Scanning LEAPS chains...{Style.RESET_ALL}")
+                opportunities = LEAPSAnalyzer.find_leaps_opportunities(symbol, fetcher, budget)
+                
+                if not opportunities:
+                    warn(f"No suitable LEAPS found for {symbol}")
+                    continue
+                
+                # Group by expiration
+                by_exp = defaultdict(list)
+                for opp in opportunities:
+                    by_exp[opp['expiration']].append(opp)
+                
+                for exp in sorted(by_exp.keys()):
+                    opps = by_exp[exp]
+                    print(f"\n  {Style.BRIGHT}EXPIRATION: {exp} ({opps[0]['dte']} DTE){Style.RESET_ALL}")
+                    print("  " + "─"*85)
+                    
+                    rows = []
+                    for opp in opps[:5]:  # Top 5 per expiration
+                        rows.append([
+                            f"${opp['strike']:.0f}C",
+                            f"${opp['price']:.2f}",
+                            f"${opp['contract_cost']:.0f}",
+                            f"Δ{opp['delta']:.2f}",
+                            f"{opp['leverage']:.1f}x",
+                            f"{opp['iv']*100:.0f}%",
+                            f"${opp['breakeven']:.2f} ({opp['breakeven_pct']:+.1f}%)",
+                            f"{opp['max_contracts']}"
+                        ])
+                    
+                    print("  " + tabulate(rows, headers=["Strike", "Price", "Cost", "Delta", "Leverage", "IV", "Breakeven", "Max Qty"]).replace("\n", "\n  "))
+                
+                # Best overall recommendation
+                if opportunities:
+                    best = opportunities[0]
+                    print(f"\n  {Style.BRIGHT}💡 TOP PICK (Best Leverage){Style.RESET_ALL}")
+                    print(f"    {symbol} {best['expiration']} ${best['strike']:.0f} Call")
+                    print(f"    Price: ${best['price']:.2f} (${best['contract_cost']:.0f}/contract)")
+                    print(f"    Delta: {best['delta']:.2f} = Controls {best['shares_controlled']:.0f} equivalent shares")
+                    print(f"    Leverage: {best['leverage']:.1f}x vs stock")
+                    print(f"    Breakeven: ${best['breakeven']:.2f} ({best['breakeven_pct']:+.1f}% from current)")
+                    print(f"    Max purchase: {best['max_contracts']} contracts with ${budget:,.0f}")
+                    print(f"    Extrinsic value: ${best['extrinsic']:.2f} ({best['extrinsic_pct']:.0f}% of premium)")
+                
+                print_footer(90)
+            
+            # --- PORTFOLIO GREEKS ---
+            elif cmd == 'greeks':
+                options = pf.data.get('options', [])
+                stocks = pf.data.get('stocks', {})
+                
+                if not options:
+                    print_error("No options in portfolio", "Use 'import <file.csv>' to load your portfolio")
+                    continue
+                
+                print_header("PORTFOLIO GREEKS EXPOSURE", icon="📐")
+                
+                # Fetch all prices
+                all_symbols = set(o['symbol'] for o in options) | set(stocks.keys())
+                stock_prices = {}
+                prog = ProgressBar(len(all_symbols), "  Fetching prices")
+                with ThreadPoolExecutor(max_workers=10) as executor:
+                    futures = {executor.submit(fetcher.get_stock_price, sym): sym for sym in all_symbols}
+                    for i, f in enumerate(as_completed(futures)):
+                        sym = futures[f]
+                        stock_prices[sym] = f.result()
+                        prog.update(i, sym)
+                prog.done()
+                
+                # Calculate portfolio Greeks
+                print(f"  {Fore.CYAN}Calculating Greeks...{Style.RESET_ALL}")
+                greeks_analysis = PortfolioGreeksAnalyzer.calculate_portfolio_greeks(options, fetcher, stock_prices)
+                
+                totals = greeks_analysis['totals']
+                
+                # Overall summary
+                print(f"\n  {Style.BRIGHT}AGGREGATE GREEKS{Style.RESET_ALL}")
+                print(f"    Net Delta:     {totals['delta']:+.1f} shares")
+                print(f"    Delta $:       {fmt_money(totals['delta_dollars'])} exposure")
+                print(f"    Net Gamma:     {totals['gamma']:+.4f}")
+                print(f"    Net Theta:     {Fore.RED if totals['theta'] < 0 else Fore.GREEN}${totals['theta']:.2f}/day{Style.RESET_ALL}")
+                print(f"    Net Vega:      ${totals['vega']:.2f}")
+                
+                # Add stock delta
+                stock_delta = sum(pos['qty'] for pos in stocks.values())
+                stock_delta_dollars = sum(pos['qty'] * stock_prices.get(sym, {}).get('price', 0) for sym, pos in stocks.items())
+                
+                print(f"\n  {Style.BRIGHT}INCLUDING STOCKS{Style.RESET_ALL}")
+                print(f"    Stock Delta:   {stock_delta:+.1f} shares ({fmt_money(stock_delta_dollars)})")
+                print(f"    Total Delta:   {totals['delta'] + stock_delta:+.1f} shares")
+                print(f"    Total $ Exp:   {fmt_money(totals['delta_dollars'] + stock_delta_dollars)}")
+                
+                # By underlying
+                print(f"\n  {Style.BRIGHT}BY UNDERLYING{Style.RESET_ALL}")
+                by_und = greeks_analysis['by_underlying']
+                und_rows = []
+                for sym, data in sorted(by_und.items(), key=lambda x: abs(x[1]['delta']), reverse=True):
+                    stock_qty = stocks.get(sym, {}).get('qty', 0)
+                    total_delta = data['delta'] + stock_qty
+                    und_rows.append([
+                        sym,
+                        fmt_money(data.get('und_price', 0)),
+                        f"{data['delta']:+.0f}",
+                        f"{stock_qty:+.0f}",
+                        f"{total_delta:+.0f}",
+                        f"${data['theta']:.2f}",
+                        f"{data['contracts']}"
+                    ])
+                
+                print(tabulate(und_rows[:10], headers=["Symbol", "Price", "Opt Δ", "Stock", "Total Δ", "Theta/d", "Contracts"]))
+                
+                # By expiry
+                print(f"\n  {Style.BRIGHT}BY EXPIRATION{Style.RESET_ALL}")
+                by_exp = greeks_analysis['by_expiry']
+                exp_rows = []
+                for exp in sorted(by_exp.keys()):
+                    data = by_exp[exp]
+                    days = dte(exp)
+                    is_leaps = days >= LEAPSAnalyzer.LEAPS_MIN_DTE
+                    exp_str = f"{exp} ({days}d)"
+                    if is_leaps:
+                        exp_str = Fore.GREEN + exp_str + " LEAPS" + Style.RESET_ALL
+                    elif days < 90:
+                        exp_str = Fore.RED + exp_str + Style.RESET_ALL
+                    
+                    exp_rows.append([
+                        exp_str,
+                        f"{data['delta']:+.0f}",
+                        f"${data['theta']:.2f}",
+                        f"{data['contracts']}",
+                        fmt_money(data['value'])
+                    ])
+                
+                print(tabulate(exp_rows, headers=["Expiration", "Delta", "Theta/d", "Contracts", "Value"]))
+                
+                # LEAPS vs non-LEAPS breakdown
+                print(f"\n  {Style.BRIGHT}LEAPS vs NON-LEAPS{Style.RESET_ALL}")
+                leaps_count = greeks_analysis['leaps_count']
+                non_leaps_count = greeks_analysis['non_leaps_count']
+                print(f"    LEAPS positions:     {leaps_count}")
+                print(f"    Non-LEAPS positions: {non_leaps_count}")
+                
+                if non_leaps_count > 0 and leaps_count > 0:
+                    ratio = leaps_count / (leaps_count + non_leaps_count) * 100
+                    print(f"    LEAPS allocation:    {ratio:.0f}%")
+                
+                # Risk assessment
+                print(f"\n  {Style.BRIGHT}RISK ASSESSMENT{Style.RESET_ALL}")
+                
+                # Delta exposure
+                if abs(totals['delta_dollars']) > 100000:
+                    print(f"    ⚠️  High delta exposure: {fmt_money(totals['delta_dollars'])}")
+                else:
+                    print(f"    ✓ Delta exposure manageable")
+                
+                # Theta decay
+                if totals['theta'] < -50:
+                    print(f"    ⚠️  High theta decay: ${abs(totals['theta']):.0f}/day = ${abs(totals['theta'])*30:.0f}/month")
+                elif totals['theta'] < 0:
+                    print(f"    ⚡ Theta decay: ${abs(totals['theta']):.0f}/day")
+                else:
+                    print(f"    ✓ Net theta positive (short options)")
+                
+                print_footer(90)
+            
             elif len(cmd) <= 5 and cmd.isalpha(): 
                 d = fetcher.get_stock_price(cmd)
                 print(f"  {cmd.upper()}: {fmt_money(d['price'])} ({color_pct(d['pct'])})")
+                # Show first-time tip if this is their first lookup
+                if last_symbol is None:
+                    print_tip('first_stock')
                 last_symbol = cmd.upper()
                 
         except Exception as e: err(str(e))
